@@ -313,6 +313,16 @@ matcher = FlexGlue().eval().cuda().compile(mode="reduce-overhead")
 ```
 The transformer layers and the correspondence heads are compiled into CUDA graphs. Keypoints are padded to the next of `static_lengths` (512, 1024, 2048, 4096 by default), larger inputs fall back to eager mode. The first calls of each new input size are slow while compiling.
 
+## torch.hub
+
+FlexGlue can also be loaded with `torch.hub`, without installing this repository. Arguments are passed to `FlexGlue`:
+```python
+import torch
+
+matcher = torch.hub.load("cvg/FlexGlue", "flexglue", trust_repo=True).eval().cuda()
+matcher = torch.hub.load("cvg/FlexGlue", "flexglue", trust_repo=True, refine=True)  # with arguments
+```
+
 ## Checklist
 
 - [x] Publish the inference code
