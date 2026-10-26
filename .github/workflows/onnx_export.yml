@@ -1,0 +1,61 @@
+name: ONNX export
+
+# Export the ONNX models on CPU and check them against the PyTorch
+# implementation: dense features, matches, match and covisibility scores, and
+# the predicted points and confidences of all keypoints. The float16 matcher
+# needs a CUDA GPU and is not covered here.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "flexglue/**"
+      - "onnx/**"
+      - "requirements.txt"
+      - ".github/workflows/onnx_export.yml"
+  pull_request:
+    paths:
+      - "flexglue/**"
+      - "onnx/**"
+      - "requirements.txt"
+      - ".github/workflows/onnx_export.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  export-and-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only PyTorch; the export and its check depend on these versions.
+          python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install numpy opencv-python-headless \
+            onnx==1.23.2 onnxscript==0.7.2 onnxruntime==1.23.2
+          python -m pip install --no-deps -e .
+
+      - name: Cache the weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/torch/hub/checkpoints
+          key: flexglue-weights-v0.1
+
+      - name: Export the descriptor and float32 matcher
+        run: python onnx/export.py --output_dir /tmp/flexglue_onnx
+
+      - name: Check the descriptor and float32 matcher
+        run: |
+          python onnx/check.py --cpu \
+            --descriptor /tmp/flexglue_onnx/flexglue_descriptor.onnx \
+            --matcher /tmp/flexglue_onnx/flexglue_matcher.onnx

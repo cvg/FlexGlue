@@ -27,3 +27,5 @@ dependencies = {file = ["requirements.txt"]}
 
 [tool.isort]
 profile = "black"
+# Not the onnx/ folder of this repository.
+known_third_party = ["onnx"]
