@@ -1,4 +1,4 @@
-"""FlexGlue with the interface of DESIGN.md: match, match_dense and a PairContext."""
+"""FlexGlue: Sparse-to-Dense Matching and Visual Disambiguation."""
 
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from .descriptor import DINOv3Descriptor
-from .refiner import RoMaRefiner
+from .refiner import RoMav2Refiner
 from .utils import ops
 from .utils import preprocess as pp
 from .utils.modules import (
@@ -28,7 +28,7 @@ class FlexGlue(nn.Module):
         "search_dim": 64,
         "n_layers": 9,
         "num_heads": 8,
-        "filter_threshold": 0.1,  # min confidence (product in sparse mode)
+        "filter_threshold": 0.1,  # min match confidence
         "max_distance_px": 3.0,  # max cycle error, pixels of the resized image
         "min_covisibility": 0.0,  # invalidate all matches if covisibility_score is below
         "early_stop_decay": None,  # in [0, 1): decay per earlier layer (0: no decay)
@@ -42,6 +42,7 @@ class FlexGlue(nn.Module):
         "coarse_stride": 8,  # coarse grid pitch, pixels of the resized image (8: cells)
         "max_num_samples": 5000,  # matches sampled from the grids without keypoints
         "kde_balance": True,  # RoMa v2's kde balancing of the sampled matches
+        "gemm_nn": False,  # sparse: mutual NN on summed squared distances, much faster
         "query_chunk_size": 4096,  # points per correspondence-head call, bounds memory
         "weights": WEIGHTS_URL,
     }
@@ -79,36 +80,8 @@ class FlexGlue(nn.Module):
         self.descriptor = (
             DINOv3Descriptor(weights=conf.weights) if conf.describe else None
         )
-        self.refiner = RoMaRefiner(conf.refine_scales) if conf.refine else None
+        self.refiner = RoMav2Refiner(conf.refine_scales) if conf.refine else None
         self.static_lengths: Optional[Tuple[int, ...]] = None  # set by compile
-
-    def load_weights(self, weights: str) -> None:
-        """Strict for everything except whole per-layer heads, which may be absent."""
-        loaded = ops.load_state_dict(weights, "matcher.")
-        depth = len({k.split(".")[1] for k in loaded if k.startswith("transformers.")})
-        if self.conf.n_layers > depth:
-            raise ValueError(f"n_layers={self.conf.n_layers}, weights have {depth}.")
-        state_dict = {}
-        for k, v in loaded.items():
-            if k.startswith("head."):  # single-head export: the last layer's head
-                k = f"heads.{depth}." + k.removeprefix("head.")
-            k = k.replace(".disambiguate.", ".covisibility.")  # exported head name
-            parts = k.split(".")
-            limit = self.conf.n_layers + (parts[0] == "heads")
-            if parts[0] in ("transformers", "heads") and int(parts[1]) >= limit:
-                continue  # truncated model: layers past n_layers are not built
-            state_dict[k] = v
-        missing, unexpected = self.load_state_dict(state_dict, strict=False)
-        if unexpected:
-            raise KeyError(f"Unexpected weights: {unexpected}")
-        if any(not k.startswith("heads.") for k in missing):
-            raise KeyError(f"Missing weights: {missing}")
-        partial = {int(k.split(".")[1]) for k in missing}
-        for layer in partial:
-            prefix = f"heads.{layer}."
-            if any(k.startswith(prefix) for k in state_dict):
-                raise KeyError(f"Head {layer} is only partially in the weights.")
-        self.loaded_heads = set(range(self.conf.n_layers + 1)) - partial
 
     def compile(
         self,
@@ -124,38 +97,6 @@ class FlexGlue(nn.Module):
             )
         self.static_lengths = tuple(sorted(static_lengths))
         return self
-
-    def resolve_conf(self, conf: dict) -> SimpleNamespace:
-        """Merge per-call overrides with the construction conf."""
-        if unknown := conf.keys() - self.default_conf.keys():
-            raise KeyError(f"Unknown conf: {sorted(unknown)}")
-        if fixed := conf.keys() & set(self.fixed_conf):
-            raise KeyError(f"Fixed at construction: {sorted(fixed)}")
-        c = SimpleNamespace(**{**vars(self.conf), **conf})
-        if not 0 <= c.n_layers <= self.conf.n_layers:
-            raise ValueError(f"n_layers must be in [0, {self.conf.n_layers}].")
-        if c.n_layers not in self.loaded_heads:
-            raise ValueError(f"No weights for the head of layer {c.n_layers}.")
-        if c.describe and self.descriptor is None:
-            raise ValueError("describe=True needs FlexGlue(describe=True) at init.")
-        if c.refine and self.refiner is None:
-            raise ValueError("refine=True needs FlexGlue(refine=True) at init.")
-        if c.mp not in (None, "float16", "bfloat16"):
-            raise ValueError(f"mp must be 'float16', 'bfloat16' or None: {c.mp!r}")
-        if not isinstance(c.coarse_stride, int) or c.coarse_stride <= 0:
-            raise ValueError(f"coarse_stride must be a positive int: {c.coarse_stride}")
-        if c.early_stop_decay is not None:
-            if not 0 <= c.early_stop_decay < 1:
-                raise ValueError(
-                    f"early_stop_decay must be in [0, 1): {c.early_stop_decay}"
-                )
-            if c.min_covisibility <= 0:
-                raise ValueError("early_stop_decay needs min_covisibility > 0.")
-            if missing := set(range(1, c.n_layers + 1)) - self.loaded_heads:
-                raise ValueError(
-                    f"early_stop_decay needs all heads, missing {sorted(missing)}."
-                )
-        return c
 
     def forward(self, data: dict, **conf) -> dict:
         """LightGlue drop-in: data = {"image0": data0, "image1": data1}."""
@@ -530,12 +471,36 @@ class FlexGlue(nn.Module):
     def sparse_matches(self, pred: dict, data0: dict, data1: dict, conf) -> dict:
         """Mutual nearest neighbours of keypoints and predicted points."""
         kpts0, kpts1 = data0["keypoints"], data1["keypoints"]
-        dist = 0.5 * (
-            torch.cdist(pred["p2d0_i1"], kpts1) + torch.cdist(kpts0, pred["p2d1_i0"])
-        )
-        m0, m1 = ops.mutual_nn(dist)
-        scores0 = pred["confidence0"] * pred["confidence1"].gather(1, m0.clamp(0))
-        scores1 = pred["confidence1"] * pred["confidence0"].gather(1, m1.clamp(0))
+        p2d0_i1, p2d1_i0 = pred["p2d0_i1"], pred["p2d1_i0"]
+        if conf.gemm_nn:  # centered on each image for float32 precision
+            c0, c1 = (d["image_size"][:, None] / 2 for d in (data0, data1))
+            x = torch.cat([p2d0_i1 - c1, kpts0 - c0], -1)
+            y = torch.cat([kpts1 - c1, p2d1_i0 - c0], -1)
+            m0, m1 = ops.mutual_nn(ops.sq_dist_gemm(x, y))
+
+            # exact mean distance of the selected pairs only
+            def take(t: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+                return t.gather(1, m.clamp(0)[..., None].expand(-1, -1, 2))
+
+            dist0 = 0.5 * (
+                (p2d0_i1 - take(kpts1, m0)).norm(dim=-1)
+                + (kpts0 - take(p2d1_i0, m0)).norm(dim=-1)
+            )
+            dist1 = 0.5 * (
+                (take(p2d0_i1, m1) - kpts1).norm(dim=-1)
+                + (take(kpts0, m1) - p2d1_i0).norm(dim=-1)
+            )
+        else:
+            dist = 0.5 * (torch.cdist(p2d0_i1, kpts1) + torch.cdist(kpts0, p2d1_i0))
+            m0, m1 = ops.mutual_nn(dist)
+            dist0, dist1 = dist.min(2).values, dist.min(1).values
+        # geometric mean of both confidences, as the cycle score
+        scores0 = (
+            pred["confidence0"] * pred["confidence1"].gather(1, m0.clamp(0))
+        ).sqrt()
+        scores1 = (
+            pred["confidence1"] * pred["confidence0"].gather(1, m1.clamp(0))
+        ).sqrt()
         valid0 = (m0 > -1) & (scores0 >= conf.filter_threshold)
         valid1 = (m1 > -1) & (scores1 >= conf.filter_threshold)
         valid0 &= pred["valid0"] & pred["valid1"].gather(1, m0.clamp(0))
@@ -543,8 +508,8 @@ class FlexGlue(nn.Module):
         if conf.max_distance_px:  # dist averages both images, so does the scale
             scale = (self.pixel_scale(data0) + self.pixel_scale(data1)) / 2
             max_dist = conf.max_distance_px * scale[:, None]
-            valid0 &= dist.min(2).values < max_dist
-            valid1 &= dist.min(1).values < max_dist
+            valid0 &= dist0 < max_dist
+            valid1 &= dist1 < max_dist
         return {
             "matches0": torch.where(valid0, m0, -1),
             "matches1": torch.where(valid1, m1, -1),
@@ -597,3 +562,63 @@ class FlexGlue(nn.Module):
             scores.gather(1, idx),
             conf.filter_threshold,
         )
+
+    def load_weights(self, weights: str) -> None:
+        """Strict for everything except whole per-layer heads, which may be absent."""
+        loaded = ops.load_state_dict(weights, "matcher.")
+        depth = len({k.split(".")[1] for k in loaded if k.startswith("transformers.")})
+        if self.conf.n_layers > depth:
+            raise ValueError(f"n_layers={self.conf.n_layers}, weights have {depth}.")
+        state_dict = {}
+        for k, v in loaded.items():
+            if k.startswith("head."):  # single-head export: the last layer's head
+                k = f"heads.{depth}." + k.removeprefix("head.")
+            k = k.replace(".disambiguate.", ".covisibility.")  # exported head name
+            parts = k.split(".")
+            limit = self.conf.n_layers + (parts[0] == "heads")
+            if parts[0] in ("transformers", "heads") and int(parts[1]) >= limit:
+                continue  # truncated model: layers past n_layers are not built
+            state_dict[k] = v
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            raise KeyError(f"Unexpected weights: {unexpected}")
+        if any(not k.startswith("heads.") for k in missing):
+            raise KeyError(f"Missing weights: {missing}")
+        partial = {int(k.split(".")[1]) for k in missing}
+        for layer in partial:
+            prefix = f"heads.{layer}."
+            if any(k.startswith(prefix) for k in state_dict):
+                raise KeyError(f"Head {layer} is only partially in the weights.")
+        self.loaded_heads = set(range(self.conf.n_layers + 1)) - partial
+
+    def resolve_conf(self, conf: dict) -> SimpleNamespace:
+        """Merge per-call overrides with the construction conf."""
+        if unknown := conf.keys() - self.default_conf.keys():
+            raise KeyError(f"Unknown conf: {sorted(unknown)}")
+        if fixed := conf.keys() & set(self.fixed_conf):
+            raise KeyError(f"Fixed at construction: {sorted(fixed)}")
+        c = SimpleNamespace(**{**vars(self.conf), **conf})
+        if not 0 <= c.n_layers <= self.conf.n_layers:
+            raise ValueError(f"n_layers must be in [0, {self.conf.n_layers}].")
+        if c.n_layers not in self.loaded_heads:
+            raise ValueError(f"No weights for the head of layer {c.n_layers}.")
+        if c.describe and self.descriptor is None:
+            raise ValueError("describe=True needs FlexGlue(describe=True) at init.")
+        if c.refine and self.refiner is None:
+            raise ValueError("refine=True needs FlexGlue(refine=True) at init.")
+        if c.mp not in (None, "float16", "bfloat16"):
+            raise ValueError(f"mp must be 'float16', 'bfloat16' or None: {c.mp!r}")
+        if not isinstance(c.coarse_stride, int) or c.coarse_stride <= 0:
+            raise ValueError(f"coarse_stride must be a positive int: {c.coarse_stride}")
+        if c.early_stop_decay is not None:
+            if not 0 <= c.early_stop_decay < 1:
+                raise ValueError(
+                    f"early_stop_decay must be in [0, 1): {c.early_stop_decay}"
+                )
+            if c.min_covisibility <= 0:
+                raise ValueError("early_stop_decay needs min_covisibility > 0.")
+            if missing := set(range(1, c.n_layers + 1)) - self.loaded_heads:
+                raise ValueError(
+                    f"early_stop_decay needs all heads, missing {sorted(missing)}."
+                )
+        return c

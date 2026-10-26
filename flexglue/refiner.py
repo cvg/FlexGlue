@@ -1,4 +1,12 @@
-"""RoMa v2's dense refiners (Edstedt et al., MIT license), run on a FlexGlue coarse warp."""
+"""Dense refiners of RoMa v2, run on a FlexGlue coarse warp.
+
+Adapted from the official implementation and weights:
+    RoMa v2: Harder Better Faster Denser Feature Matching
+    Johan Edstedt, David Nordström, Yushan Zhang, Georg Bökman, Jonathan Astermark,
+    Viktor Larsson, Anders Heyden, Fredrik Kahl, Mårten Wadenbäck, Michael Felsberg
+    ECCV 2026, https://arxiv.org/abs/2511.15706
+    Code: https://github.com/Parskatt/RoMaV2 (MIT License, Copyright (c) 2025 Johan Edstedt)
+"""
 
 from typing import Dict, Optional, Tuple
 
@@ -140,7 +148,7 @@ class ConvRefiner(nn.Module):
         return warp, mlogit_i
 
 
-class RoMaRefiner(nn.Module):
+class RoMav2Refiner(nn.Module):
     url = "https://github.com/Parskatt/RoMaV2/releases/download/v2.0.1/romav2.0.1.pt"
     anchor = 512  # RoMa's displacement embedding is scaled relative to 512 x 512
     # stride: (feature dim, projection dim, displacement embedding dim, correlation radius)

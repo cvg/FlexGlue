@@ -102,7 +102,6 @@ def entmax15_window_readout(logits, grid, hw, radius: int = 1) -> tuple:
 
 def sq_dist_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Squared distances (B, M, N) of x (B, M, D) and y (B, N, D) in one GEMM, no sqrt passes."""
-    # TODO: use in sparse_matches with x=[p2d0_i1, kpts0], y=[kpts1, p2d1_i0] (5x faster at 16k); gate on exact dists
     ones_x, ones_y = x.new_ones(*x.shape[:-1], 1), y.new_ones(*y.shape[:-1], 1)
     xa = torch.cat([-2 * x, x.square().sum(-1, keepdim=True), ones_x], -1)
     ya = torch.cat([y, ones_y, y.square().sum(-1, keepdim=True)], -1)

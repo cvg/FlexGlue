@@ -1,7 +1,16 @@
 <p align="center">
-  <h1 align="center"><ins>FlexGlue</ins><br>Sparse-to-Dense Feature Matching and Visual Disambiguation</h1>
+  <h1 align="center"><ins>FlexGlue</ins> 🐙<br>Sparse-to-Dense Feature Matching and Visual Disambiguation</h1>
+  <p align="center">
+    <a href="https://www.linkedin.com/in/philipplindenberger/">Philipp Lindenberger</a>
+    ·
+    <a href="https://psarlin.com/">Paul-Edouard&nbsp;Sarlin</a>
+    ·
+    <a href="https://miksik.co.uk/">Ondrej&nbsp;Miksik</a>
+    ·
+    <a href="https://www.microsoft.com/en-us/research/people/mapoll/">Marc&nbsp;Pollefeys</a>
+  </p>
   <h2 align="center">
-    <a href="#" align="center">Paper</a> | 
+    <a href="https://arxiv.org/abs/2610.32976" align="center">Paper</a> | 
     <a href="https://colab.research.google.com/github/cvg/FlexGlue/blob/main/demo.ipynb" align="center">Colab</a>
   </h2>
 
@@ -54,9 +63,6 @@ python -m pip install git+https://github.com/cvg/LightGlue.git
 
 We provide a [demo notebook](demo.ipynb) which shows all matching modes on an image pair and the rejection of a look-alike pair.
 
-> [!IMPORTANT]
-> FlexGlue assumes keypoints in corner coordinates (COLMAP convention): the center of the top-left pixel is at (0.5, 0.5). LightGlue assumes center coordinates (a 0.5 px offset), so pass `origin="corner"` to its detectors, e.g. `ALIKED(origin="corner")`.
-
 Here is a minimal script to match two images. Detection is optional:
 
 ```python
@@ -65,8 +71,8 @@ from flexglue import FlexGlue
 from flexglue.utils import load_image, pack_matches, rbd
 
 # load each image as a torch.Tensor on GPU with shape (3,H,W), normalized in [0,1]
-image0 = load_image("assets/sacre_coeur1.jpg").cuda()
-image1 = load_image("assets/sacre_coeur2.jpg").cuda()
+image0 = load_image("assets/berlin1.jpg").cuda()
+image1 = load_image("assets/berlin2.jpg").cuda()
 inputs0, inputs1 = {"image": image0[None]}, {"image": image1[None]}
 
 # optional: detect keypoints to be matched
@@ -92,17 +98,20 @@ points0 = matches01["keypoints0"][matches01["matches"][..., 0]]
 points1 = matches01["keypoints1"][matches01["matches"][..., 1]]
 ```
 
+> [!IMPORTANT]
+> FlexGlue assumes keypoints in corner coordinates (COLMAP convention): the center of the top-left pixel is at (0.5, 0.5). LightGlue assumes center coordinates (a 0.5 px offset), so pass `origin="corner"` to its detectors, e.g. `ALIKED(origin="corner")`.
+
 ## Matching modes
 
 FlexGlue supports multiple matching modes, depending on whether keypoints are provided for each image and the selected mode (`sparse`):
 
 | neither has keypoints | one has keypoints (`i`) | both have keypoints |
 |---|---|---|
-| sample correspondences | each keypoint of `i` with its predicted point in `j` | both directions concatenated (`sparse=False`) or mutual nearest neighbors (`sparse=True`) |
+| sample correspondences | each keypoint of `i` gets a predicted point in `j` | matches in both directions concatenated (`sparse=False`) or mutual nearest neighbors (`sparse=True`) |
 
 `matches` always indexes `keypoints0` and `keypoints1`. Without `sparse=True`, these are row-aligned lists of corresponding points (keypoints or sampled points paired with their predicted points), so row *k* of one matches row *k* of the other. With `sparse=True`, they are the input keypoints, matched to each other.
 
-The snippet below shows how to run each mode, one after the other. The [demo notebook](demo.ipynb) shows the matches of each mode on an example pair.
+The snippet below shows **how to run each mode**, one after the other. The [demo notebook](demo.ipynb) shows the matches of each mode on an example pair.
 
 ```python
 inputs0 = matcher.descriptor.describe(image0)  # {features, image_size}
@@ -120,16 +129,13 @@ pred = matcher.match(inputs0, inputs1)
 # >>>
 # keypoints0: (1, M, 2), detected keypoints <-- inputs0["keypoints"]
 # keypoints1: (1, M, 2), predictions
-# matches0: (1, M), k for row k, or -1 if filtered
-# p2d0_i1: (1, M, 2), predicted points of all keypoints, also filtered ones
 
-# both have keypoints: concatenate bidirectional (default)
+# both have keypoints: concatenate bidirectional (default, recommended)
 inputs1.update(detector.extract(image1))
 pred = matcher.match(inputs0, inputs1)
 # >>>
 # keypoints0: (1, M+N, 2), [keypoints0, p2d1_i0]
 # keypoints1: (1, M+N, 2), [p2d0_i1, keypoints1]
-# matches0: (1, M+N), k for row k, or -1 if filtered
 
 # both have keypoints: mutual nearest neighbors between the keypoints
 pred = matcher.match(inputs0, inputs1, sparse=True)
@@ -152,7 +158,7 @@ pred = matcher.match_dense(inputs0, inputs1)
 # dense_p2d0_i1: (B, h, w, 2), h x w = describe_resize / coarse_stride (64x64 by default)
 ```
 
-For increased sub-pixel accuracy, we refine dense correspondences with the refiners of [RoMa v2](https://github.com/Parskatt/RoMaV2), whose weights are downloaded automatically:
+For increased sub-pixel accuracy, we recommend to use the excellent [RoMa v2](https://github.com/Parskatt/RoMaV2) refiner, whose weights are downloaded automatically:
 
 ```python
 # refined with the RoMa v2 refiners, at refine_resize resolution
@@ -163,15 +169,11 @@ pred = matcher.match_dense(inputs0, inputs1)
 pred = matcher.match(inputs0, inputs1)  # refined matches
 ```
 
-The coarse features of each image can be computed once and cached, useful when matching a large image set exhaustive:
+**To improve matching accuracy and robustness**, the biggest lever is increased resolution (see Table 2 in the paper):
 
 ```python
-from flexglue import DINOv3Descriptor
-
-descriptor = DINOv3Descriptor().eval().cuda()
-inputs0.update(descriptor.describe(image0))  # {features, image_size}
-inputs1.update(descriptor.describe(image1))
-pred = matcher.match(inputs0, inputs1)  # reuses the cached features
+# descriptor input at 640x640 instead of the default 512x512
+matcher = FlexGlue(describe_resize=(640, 640)).eval().cuda()
 ```
 
 <details>
@@ -263,27 +265,28 @@ Batching has a few requirements:
 <summary>[Detail of all parameters - click to expand]</summary>
 
 `DINOv3Descriptor`:
-- ```resize```: Size of the image fed to the backbone. An int sets the long side and keeps the aspect ratio, both sides floored to multiples of 32. A tuple ```(h, w)``` squashes the image to that size, ignoring the aspect ratio. Default: (512, 512).
-- ```describe```: Add the descriptors of the keypoints when ```describe``` gets keypoints. Default: True.
-- ```weights```: Path or URL of the descriptor weights. Default: the release weights.
+- ```resize```: Backbone input size: an int sets the long side (aspect kept, sides floored to multiples of 32), ```(h, w)``` squashes. Default: (512, 512).
+- ```describe```: Also return descriptors at the given keypoints. Default: True.
+- ```weights```: Path or URL of the weights. Default: the release weights.
 
 `FlexGlue`:
-- ```n_layers```: Number of transformer layers. Reduce this value for faster inference at the cost of accuracy. Can be overridden per call. Default: 9 (all layers).
-- ```filter_threshold```: Match confidence. Increase this value to obtain less, but stronger matches. In sparse mode, it applies to the product of the confidences of both keypoints. Default: 0.1.
-- ```max_distance_px```: Maximum cycle error: a prediction is mapped back to its source image and must land within this distance. In sparse mode, it instead bounds the distance of mutual nearest neighbors, without the cycle check. In pixels of the resized image fed to the descriptor. None disables it. Default: 3.0.
-- ```min_covisibility```: Reject all matches of a pair whose ```covisibility_score``` is below this value. Default: 0.0 (off). Recommended: 0.8 for noisy image sets.
-- ```early_stop_decay```: Controls the early stopping on rejected pairs: FlexGlue stops after layer ```k``` if ```covisibility_score < min_covisibility * (1 - early_stop_decay) ** (9 - k)```. A lower value stops more often at earlier layers. Requires ```min_covisibility > 0```. Default: None (off).
-- ```remove_border_px```: Invalidate matches whose points lie within this many pixels of the image border, in pixels of the resized image as ```max_distance_px```. Default: 0.0.
-- ```mp```: Precision of the transformer: ```"float16"```, ```"bfloat16"``` or ```None``` (float32). The readout always runs in float32. Default: ```"float16"```.
-- ```describe_resize```: Size of the images fed to the built-in descriptor, for inputs without ```features```, as ```resize``` of ```DINOv3Descriptor```. Default: (512, 512).
-- ```refine```: Build the RoMa v2 refiners, and refine the predictions at ```refine_resize```. Needs ```image``` in the inputs, as returned by ```DINOv3Descriptor.describe```. Can be disabled per call. Default: False.
-- ```refine_resize```: Size of the images fed to the refiners, as ```resize``` of ```DINOv3Descriptor```. Default: (512, 512).
-- ```refine_scales```: Strides of the RoMa v2 refiners, coarse to fine. Fixed at construction. Default: (2, 1), RoMa v2 also has (4, 2, 1).
-- ```coarse_stride```: Pitch of the coarse grid of ```match_dense``` and the sampled mode, in pixels of the resized image. Without refinement it is the output grid, with refinement the grid the refiners start from. 8 queries every feature cell, smaller values query between cells (4 gives 2x the resolution). Must divide the resized size. Default: 8.
-- ```max_num_samples```: Maximum number of matches sampled from the dense grids when neither image has keypoints, before filtering. Default: 10000.
-- ```query_chunk_size```: Maximum number of points the correspondence head processes at once, to bound memory for many keypoints or a fine ```coarse_stride```. Results do not depend on it. Fixed at construction. Default: 4096.
-- ```kde_balance```: Sample the matches as RoMa v2, spread over the image by a kernel density estimate, and drop isolated matches. Otherwise they are drawn proportional to their confidence. Default: True.
-- ```weights```: Path or URL of the matcher weights. Default: the release weights.
+- ```n_layers```: Number of transformer layers, fewer is faster but less accurate. Default: 9 (all).
+- ```filter_threshold```: Minimum match confidence. Default: 0.1.
+- ```max_distance_px```: Maximum cycle error, or mutual nearest-neighbor distance in sparse mode, in pixels of the resized image. None disables it. Default: 3.0.
+- ```min_covisibility```: Reject all matches of pairs with a lower ```covisibility_score```, e.g. 0.8 for noisy image sets. Default: 0.0 (off).
+- ```early_stop_decay```: Stop after layer ```k``` if ```covisibility_score < min_covisibility * (1 - early_stop_decay) ** (9 - k)```, lower stops earlier. Default: None (off).
+- ```remove_border_px```: Drop matches this close to the border, in pixels of the resized image. Default: 0.0.
+- ```mp```: Transformer mixed precision: ```"float16"```, ```"bfloat16"``` or ```None``` (float32). Default: ```"float16"```.
+- ```describe_resize```: Input size of the built-in descriptor, as ```resize``` above. Default: (512, 512).
+- ```gemm_nn```: Sparse mode: mutual nearest neighbors in one matrix multiplication, faster for many keypoints. Default: False.
+- ```query_chunk_size```: Points per correspondence-head call, bounds memory without changing results. Default: 4096.
+- ```weights```: Path or URL of the weights. Default: the release weights.
+- ```coarse_stride```: Grid pitch of ```match_dense``` and the sampled mode, in pixels of the resized image (4 doubles the resolution). Default: 8.
+- ```max_num_samples```: Maximum number of sampled matches without keypoints. Default: 5000.
+- ```kde_balance```: Spread the sampled matches over the image as RoMa v2, instead of drawing by confidence. Default: True.
+- ```refine```: Refine with RoMa v2 refiners (needs ```image``` in the inputs). Default: False.
+- ```refine_resize```: Input size of the refiners, as ```resize``` above. Default: (512, 512).
+- ```refine_scales```: Refiner strides, coarse to fine, fixed at construction. Default: (2, 1).
 
 </details>
 
@@ -310,5 +313,27 @@ matcher = FlexGlue().eval().cuda().compile(mode="reduce-overhead")
 ```
 The transformer layers and the correspondence heads are compiled into CUDA graphs. Keypoints are padded to the next of `static_lengths` (512, 1024, 2048, 4096 by default), larger inputs fall back to eager mode. The first calls of each new input size are slow while compiling.
 
+## Checklist
+
+- [x] Publish the inference code
+- [ ] Integration into [COLMAP](https://github.com/colmap/colmap)
+- [ ] Integration into [hloc](https://github.com/cvg/Hierarchical-Localization)
+- [ ] Release the training and evaluation code in [glue-factory](https://github.com/cvg/glue-factory)
+
 ## License
 The code provided in this repository is released under the [MIT license](./LICENSE). The model weights (`flexglue.pth`) contain the [DINOv3](https://github.com/facebookresearch/dinov3) ConvNeXt-B backbone (`extractor.backbone.*`), which is distributed under the [DINOv3 License](./DINOv3_LICENSE.md) and restricts its use. All other weights, the matcher and the descriptor heads, are released under the MIT license. The refiners in [refiner.py](./flexglue/refiner.py) and their weights come from [RoMa v2](https://github.com/Parskatt/RoMaV2) and follow its MIT license. The keypoint detectors are not part of this repository, see [LightGlue](https://github.com/cvg/LightGlue#license) for their licenses.
+
+## BibTeX citation
+If you use any ideas from the paper or code from this repo, please consider citing:
+
+```txt
+@article{lindenberger2026flexglue,
+  author    = {Philipp Lindenberger and
+               Paul-Edouard Sarlin and
+               Ondrej Miksik and
+               Marc Pollefeys},
+  title     = {{FlexGlue: Sparse-to-Dense Feature Matching and Visual Disambiguation}},
+  journal   = {arXiv preprint arXiv:2610.32976},
+  year      = {2026}
+}
+```
