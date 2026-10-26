@@ -278,7 +278,7 @@ Batching has a few requirements:
 - ```remove_border_px```: Drop matches this close to the border, in pixels of the resized image. Default: 0.0.
 - ```mp```: Transformer mixed precision: ```"float16"```, ```"bfloat16"``` or ```None``` (float32). Default: ```"float16"```.
 - ```describe_resize```: Input size of the built-in descriptor, as ```resize``` above. Default: (512, 512).
-- ```gemm_nn```: Sparse mode: mutual nearest neighbors in one matrix multiplication, faster for many keypoints. Default: False.
+- ```gemm_nn```: Sparse mode: mutual nearest neighbors in one matrix multiplication, faster for many keypoints. Default: True.
 - ```query_chunk_size```: Points per correspondence-head call, bounds memory without changing results. Default: 4096.
 - ```weights```: Path or URL of the weights. Default: the release weights.
 - ```coarse_stride```: Grid pitch of ```match_dense``` and the sampled mode, in pixels of the resized image (4 doubles the resolution). Default: 8.

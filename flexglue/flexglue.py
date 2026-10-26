@@ -42,7 +42,7 @@ class FlexGlue(nn.Module):
         "coarse_stride": 8,  # coarse grid pitch, pixels of the resized image (8: cells)
         "max_num_samples": 5000,  # matches sampled from the grids without keypoints
         "kde_balance": True,  # RoMa v2's kde balancing of the sampled matches
-        "gemm_nn": False,  # sparse: mutual NN on summed squared distances, much faster
+        "gemm_nn": True,  # sparse: mutual NN on summed squared distances, much faster
         "query_chunk_size": 4096,  # points per correspondence-head call, bounds memory
         "weights": WEIGHTS_URL,
     }
