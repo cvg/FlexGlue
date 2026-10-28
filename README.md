@@ -191,7 +191,7 @@ Outputs of `matcher(...)` and `matcher.match(...)`, for each direction `i -> j` 
 - `p2d{i}_n{j}`: `(B, M, 2)` the same, in normalized coordinates `[-1, 1]`.
 - `confidence{i}`: `(B, M)` confidence that the keypoint has a correspondence. With the cycle check, the geometric mean of the forward confidence and the confidence of the prediction mapped back to `i`.
 - `valid{i}`: `(B, M)` whether the keypoint passes the covisibility, border and cycle checks.
-- `cycle_error{i}`: `(B, M)` cycle error in pixels, with `max_distance_px` and not `sparse=True`.
+- `cycle_error{i}`: `(B, M)` cycle error in pixels of the resized image `i` (the descriptor input), with `max_distance_px` and not `sparse=True`.
 - `covisibility_score`: `(B,)` probability that the two images show the same place.
 - `stop_layer`: the layer at which the matcher stopped.
 
@@ -272,10 +272,10 @@ Batching has a few requirements:
 `FlexGlue`:
 - ```n_layers```: Number of transformer layers, fewer is faster but less accurate. Default: 9 (all).
 - ```filter_threshold```: Minimum match confidence. Default: 0.1.
-- ```max_distance_px```: Maximum cycle error, or mutual nearest-neighbor distance in sparse mode, in pixels of the resized image. None disables it. Default: 3.0.
+- ```max_distance_px```: Maximum cycle error, or mutual nearest-neighbor distance in sparse mode, in pixels of the resized image (the descriptor input). None disables it. Default: 3.0.
 - ```min_covisibility```: Reject all matches of pairs with a lower ```covisibility_score```, e.g. 0.8 for noisy image sets. Default: 0.0 (off).
 - ```early_stop_decay```: Stop after layer ```k``` if ```covisibility_score < min_covisibility * (1 - early_stop_decay) ** (9 - k)```, lower stops earlier. Default: None (off).
-- ```remove_border_px```: Drop matches this close to the border, in pixels of the resized image. Default: 0.0.
+- ```remove_border_px```: Drop matches this close to the border, in pixels of the resized image (as ```max_distance_px```). Default: 0.0.
 - ```mp```: Transformer mixed precision: ```"float16"```, ```"bfloat16"``` or ```None``` (float32). Default: ```"float16"```.
 - ```describe_resize```: Input size of the built-in descriptor, as ```resize``` above. Default: (512, 512).
 - ```gemm_nn```: Sparse mode: mutual nearest neighbors in one matrix multiplication, faster for many keypoints. Default: True.
