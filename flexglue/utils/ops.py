@@ -85,11 +85,17 @@ def entmax15_threshold(
     return tau
 
 
-def entmax15_window_readout(logits, grid, hw, radius: int = 1) -> tuple:
+def entmax15_window_readout(logits, grid, hw, radius: int = 1, k: int = 512) -> tuple:
     """1.5-entmax expected position (B, N, 2) and mass (B, N) around the argmax."""
-    vmax, idx = logits.max(-1, keepdim=True)
-    y = (logits - vmax) / 2
-    tau = entmax15_threshold(y)
+    if logits.shape[-1] > k:  # maximum and threshold from the same (sorted) top-k
+        topv, topi = logits.topk(k, dim=-1)
+        vmax, idx = topv[..., :1], topi[..., :1]
+        y = (logits - vmax) / 2
+        tau = sorted_entmax15_threshold((topv - vmax) / 2)
+    else:
+        vmax, idx = logits.max(-1, keepdim=True)
+        y = (logits - vmax) / 2
+        tau = entmax15_threshold(y, k)
     h, w = hw
     r = torch.arange(-radius, radius + 1, device=y.device)
     ny = (idx // w)[..., None] + r[:, None]
@@ -107,6 +113,25 @@ def sq_dist_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     xa = torch.cat([-2 * x, x.square().sum(-1, keepdim=True), ones_x], -1)
     ya = torch.cat([y, ones_y, y.square().sum(-1, keepdim=True)], -1)
     return xa @ ya.mT
+
+
+def sq_dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Squared distances (B, M, N) of x (B, M, D) and y (B, N, D), from differences.
+
+    Slower than sq_dist_gemm but exact, also where float32 matrix multiplications
+    run in TF32 (e.g. ONNX Runtime on CUDA by default). One coordinate at a time,
+    without (B, M, N, D) intermediates.
+    """
+    return sum(
+        (x[..., i, None] - y[..., i][:, None]).square() for i in range(x.shape[-1])
+    )
+
+
+def is_set(threshold) -> bool:
+    """Whether an optional threshold is on: positive, or a tensor (traced input)."""
+    return isinstance(threshold, torch.Tensor) or (
+        threshold is not None and threshold > 0
+    )
 
 
 def mutual_nn(dist: torch.Tensor):
