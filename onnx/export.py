@@ -43,6 +43,9 @@ com.microsoft::MultiHeadAttention contrib operator of ONNX Runtime (flash /
 memory-efficient attention on CUDA) instead of being decomposed into
 MatMul/Softmax/MatMul, which materializes the attention matrices. Such models
 require ONNX Runtime; use --no_fused_attention for standard ONNX operators.
+Likewise, the GELU activations of the matcher are exported as the
+com.microsoft::Gelu operator, a single kernel instead of five element-wise
+operators (Div, Erf, Add, Mul, Mul) that ONNX Runtime does not fuse.
 
 Requires onnx and onnxscript.
 
@@ -119,6 +122,41 @@ def multi_head_attention_onnx(query, key, value, num_heads: int):
     return MSFT_OPSET.MultiHeadAttention(query, key, value, num_heads=num_heads)
 
 
+# Schema of ONNX Runtime's contrib Gelu operator (exact, erf-based).
+onnx.defs.register_schema(
+    OpSchema(
+        "Gelu",
+        "com.microsoft",
+        1,
+        inputs=[OpSchema.FormalParameter("X", "T")],
+        outputs=[OpSchema.FormalParameter("Y", "T")],
+        type_constraints=[("T", ["tensor(float)", "tensor(float16)"], "")],
+    )
+)
+
+
+@torch.library.custom_op("flexglue::gelu", mutates_args=())
+def gelu(x: torch.Tensor) -> torch.Tensor:
+    """Exact GELU, as com.microsoft::Gelu and nn.GELU()."""
+    return F.gelu(x)
+
+
+@gelu.register_fake
+def _(x):
+    return torch.empty_like(x)
+
+
+def gelu_onnx(x):
+    return MSFT_OPSET.Gelu(x)
+
+
+class FusedGELU(nn.Module):
+    """nn.GELU with the fused operator."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.ops.flexglue.gelu(x)
+
+
 def fused_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     """modules.attention on (B, N, H, D) tensors with the fused operator."""
     return torch.ops.flexglue.multi_head_attention(
@@ -133,6 +171,12 @@ def exportable(matcher: FlexGlue, fused: bool = True):
         block.self_attn.use_blocked_qkv()
     for head in matcher.heads:
         head.query_chunk_size = None  # cannot split a dynamic number of keypoints
+    if fused:
+        for layer in matcher.transformers:
+            for ffn in (layer.self_attn.ffn, layer.cross_attn.ffn):
+                gelus = [i for i, m in enumerate(ffn) if isinstance(m, nn.GELU)]
+                for i in gelus:
+                    ffn[i] = FusedGELU()
     original = modules.attention
     if fused:
         modules.attention = fused_attention
@@ -369,7 +413,8 @@ def export_matcher(
             custom_translation_table={
                 torch.ops.flexglue.multi_head_attention.default: (
                     multi_head_attention_onnx
-                )
+                ),
+                torch.ops.flexglue.gelu.default: gelu_onnx,
             },
         )
     make_keypoint_dims_dynamic(path)
@@ -391,7 +436,8 @@ def parse_args():
     parser.add_argument(
         "--no_fused_attention",
         action="store_true",
-        help="Decompose the attention into standard ONNX operators.",
+        help="Use standard ONNX operators instead of the fused attention and "
+        "GELU operators of ONNX Runtime.",
     )
     parser.add_argument(
         "--matcher_only",
