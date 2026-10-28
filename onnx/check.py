@@ -9,7 +9,12 @@ the assets, with SIFT keypoints, and compares:
   the checkpoint with the same options as the matcher (onnx/export.py).
 
 The options of the matcher (float16 transformer layers, fused operators of
-ONNX Runtime) and the input resolution are read from the models.
+ONNX Runtime, early stopping) and the input resolution are read from the
+models. A matcher with early stopping is compared with early_stop_decay=1,
+which never stops early. If it checks the covisibility score after every layer
+but the last, as FlexGlue does (export with --early_stop_layers 1,...,8), it is
+also compared with early stopping, for early_stop_decay in EARLY_STOP_DECAYS.
+Otherwise, the outputs with early stopping are only printed.
 
 Requires onnx, onnxscript and onnxruntime (onnxruntime-gpu on GPU).
 
@@ -20,6 +25,7 @@ Usage (from the root of the repository):
 """
 
 import argparse
+import re
 import sys
 import tempfile
 import time
@@ -47,6 +53,7 @@ CHECK_PAIRS = [
     ("lamar_cab_1446.jpg", "lamar_cab_1450.jpg"),
 ]
 CHECK_MIN_COVISIBILITY = (0.0, 0.8)
+EARLY_STOP_DECAYS = (0.0, 0.2, 0.5)
 
 # Tolerances of the check, for float32 on CPU / float32 on CUDA / float16 on
 # CUDA. On CPU, ONNX Runtime and PyTorch agree to ~1e-5. On CUDA, ONNX Runtime
@@ -99,6 +106,14 @@ def matcher_options(path: Path):
             node.domain == "com.microsoft" and node.op_type == "MultiHeadAttention"
             for g in graphs
             for node in g.node
+        ),
+        early_stop="early_stop_decay" in [i.name for i in model.graph.input],
+        # Layers after which the graph may stop early (see add_early_stopping).
+        early_stop_layers=sorted(
+            int(m.group(1))
+            for g in graphs
+            for node in g.node
+            if (m := re.fullmatch(r"early_stop_layer(\d+)_if", node.name))
         ),
     )
 
@@ -163,7 +178,15 @@ def descriptor_error(session, image: torch.Tensor, features, size) -> float:
     return np.abs(features_ort - features["features"].cpu().numpy()).max()
 
 
-def match_pytorch(matcher, features0, features1, kpts0, kpts1, min_covisibility):
+def match_pytorch(
+    matcher,
+    features0,
+    features1,
+    kpts0,
+    kpts1,
+    min_covisibility,
+    early_stop_decay=None,
+):
     """Predictions of FlexGlue.match as in the exported graph, as numpy arrays."""
     device = features0["features"].device
     data0 = {**features0, "keypoints": kpts0.to(device)}
@@ -176,6 +199,7 @@ def match_pytorch(matcher, features0, features1, kpts0, kpts1, min_covisibility)
             mp=None,
             exact_nn=True,
             min_covisibility=min_covisibility,
+            early_stop_decay=early_stop_decay,
         )
     return {k: v.cpu().numpy() for k, v in pred.items() if isinstance(v, torch.Tensor)}
 
@@ -262,7 +286,11 @@ def check_matches(sessions, matcher, features, kpts, min_covisibility, tol, timi
     """Compare the matchers on one pair of images and keypoints."""
     pred = match_pytorch(matcher, *features, *kpts, min_covisibility)
     feeds = matcher_feeds(*features, *kpts, min_covisibility)
-    ok, message = compare_matches(pred, sessions.matcher.run(None, feeds), tol)
+    match_feeds = feeds
+    if sessions.early_stop:  # early_stop_decay=1 never stops early
+        match_feeds = {**feeds, "early_stop_decay": np.array(1.0, np.float32)}
+    outputs = sessions.matcher.run(None, match_feeds)
+    ok, message = compare_matches(pred, outputs, tol)
     if min_covisibility == 0:  # otherwise, the points may not be computed
         outputs = sessions.debug.run(None, feeds)[len(MATCHER_OUTPUTS) :]
         points_ok, points_message = compare_points(
@@ -271,13 +299,46 @@ def check_matches(sessions, matcher, features, kpts, min_covisibility, tol, timi
         ok &= points_ok
         message += " " + points_message
     if timing:
-        message += f" ort_time={time_session(sessions.matcher, feeds):.0f}ms"
+        message += f" ort_time={time_session(sessions.matcher, match_feeds):.0f}ms"
     num_keypoints = "/".join(str(k.shape[1]) for k in kpts)
     print(
         f"  N={num_keypoints} min_covis={min_covisibility:.1f}: {message} "
         f"{'OK' if ok else 'FAIL'}"
     )
+    if sessions.early_stop and min_covisibility > 0:
+        if sessions.early_stop_comparable:
+            for decay in EARLY_STOP_DECAYS:
+                ok &= check_early_stop(
+                    sessions.matcher, matcher, features, kpts, feeds, decay, tol
+                )
+        else:
+            print_early_stop(sessions.matcher, feeds, early_stop_decay=0.5)
     return bool(ok)
+
+
+def check_early_stop(session, matcher, features, kpts, feeds, decay, tol):
+    """Compare the matchers with early stopping, if both check the same layers."""
+    min_covisibility = float(feeds["min_covisibility"])
+    pred = match_pytorch(
+        matcher, *features, *kpts, min_covisibility, early_stop_decay=decay
+    )
+    outputs = session.run(
+        None, {**feeds, "early_stop_decay": np.array(decay, np.float32)}
+    )
+    ok, message = compare_matches(pred, outputs, tol)
+    print(f"    early_stop_decay={decay}: {message} {'OK' if ok else 'FAIL'}")
+    return ok
+
+
+def print_early_stop(session, feeds, early_stop_decay: float):
+    """Outputs with early stopping, not compared: the graph checks fewer layers
+    than FlexGlue, which checks every layer but the last."""
+    feeds = {**feeds, "early_stop_decay": np.array(early_stop_decay, np.float32)}
+    matches0, _, covisibility_score = session.run(None, feeds)
+    print(
+        f"    early_stop_decay={early_stop_decay}: "
+        f"matches={(matches0[0] > -1).sum()} covis={covisibility_score[0]:.4f}"
+    )
 
 
 def check_pair(sessions, models, names, size, num_keypoints, tol, timing):
@@ -326,7 +387,13 @@ def main():
     providers = onnx_providers(args.cpu)
     device = "cuda" if providers[0].startswith("CUDA") else "cpu"
     print(f"ONNX Runtime {ort.__version__}, providers: {providers}")
-    sessions = SimpleNamespace(descriptor=None, matcher=None, debug=None)
+    sessions = SimpleNamespace(
+        descriptor=None,
+        matcher=None,
+        debug=None,
+        early_stop=False,
+        early_stop_comparable=False,
+    )
     models = SimpleNamespace(descriptor=None, matcher=None)
     sizes, precision = set(), ""
     if args.descriptor is not None:
@@ -346,6 +413,10 @@ def main():
         models.matcher.eval()
         sessions.matcher = ort.InferenceSession(str(args.matcher), providers=providers)
         sessions.debug = debug_session(models.matcher, options, providers)
+        sessions.early_stop = options.early_stop
+        sessions.early_stop_comparable = options.early_stop_layers == list(
+            range(1, models.matcher.conf.n_layers)
+        )
         models.matcher = models.matcher.to(device)
     if len(sizes) > 1:
         raise SystemExit(f"The models have different input sizes: {sizes}")
