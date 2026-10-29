@@ -155,7 +155,8 @@ def lattice_kde(
     tent = torch.where(corners.bool(), frac[:, :, None], 1 - frac[:, :, None]).prod(-1)
     lattice = u.new_zeros(b, size**d)
     lattice.scatter_add_(1, idx, (tent * weights[..., None].float()).flatten(1))
-    s = math.sqrt(std**2 - pitch**2 / 3)  # splat and read tents add pitch^2 / 6 each
+    # splat and read tents add pitch^2 / 6 each
+    s = math.sqrt(std**2 - pitch**2 / 3)
     r = math.ceil(3 * s / pitch)
     k = torch.arange(-r, r + 1, device=points.device) * pitch
     kernel = (std / s * torch.exp(-(k**2) / (2 * s**2))).view(1, 1, -1)
