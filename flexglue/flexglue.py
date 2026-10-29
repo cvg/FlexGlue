@@ -30,10 +30,10 @@ class FlexGlue(nn.Module):
         "num_heads": 8,
         "filter_threshold": 0.1,  # min match confidence
         "max_distance_px": 3.0,  # max cycle error, pixels of the resized image
-        "min_covisibility": 0.0,  # invalidate all matches if covisibility_score is below
+        "min_covisibility": 0.0,  # invalidate matches if covisibility_score is below
         "early_stop_decay": None,  # in [0, 1): decay per earlier layer (0: no decay)
         "remove_border_px": 0.0,  # border margin, pixels of the resized image
-        "mp": "float16",  # transformer dtype: float16, bfloat16 or None (fp32), readout in fp32
+        "mp": "float16",  # transformer dtype: float16, bfloat16 or None (fp32)
         "describe": True,  # build a DINOv3Descriptor for inputs without features
         "describe_resize": (512, 512),  # descriptor input, as refine_resize
         "refine": False,  # refine with RoMa v2's dense refiners
@@ -225,7 +225,7 @@ class FlexGlue(nn.Module):
     def prepare_dense(
         self, context: PairContext, data0: dict, data1: dict, dirs: List[tuple], conf
     ) -> Dict[int, Dict[str, torch.Tensor]]:
-        """Refined grids by source image, both directions if the cycle check needs them."""
+        """Refined corresp. if refine is True, bidirectional under cycle check."""
         if not conf.refine:
             return {}
         if conf.max_distance_px:
@@ -267,7 +267,7 @@ class FlexGlue(nn.Module):
     def decode_pair(
         self, data0: dict, data1: dict, conf: SimpleNamespace
     ) -> PairContext:
-        """Cross features and covisibility_score of the pair, refiner features if refine."""
+        """Cross features and covisibility_score of the pair (+ refine features)."""
         if self.static_lengths is not None:  # new CUDA graph step per pair
             torch.compiler.cudagraph_mark_step_begin()
         f0, f1 = data0["features"], data1["features"]
@@ -373,7 +373,7 @@ class FlexGlue(nn.Module):
     def sample_correspondences(
         self, dense: Dict[str, torch.Tensor], points_ni: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Read a grid at normalized points (B, N, 2): predicted points and confidence."""
+        """Read dense correspondences and confidence at normalized points (B, N, 2)."""
         p2di_nj = ops.sample_features(ops.to_chw(dense["dense_p2di_nj"]), points_ni)
         confidence = ops.sample_features(dense["dense_confidencei"][:, None], points_ni)
         return p2di_nj, confidence[..., 0]
@@ -387,7 +387,7 @@ class FlexGlue(nn.Module):
         size_i: torch.Tensor,
         dense_j: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Map p2di_nj back to i with the grid j -> i or the head: error in px, confidence."""
+        """Map p2di_nj back to i with the dense j->i warping or the head."""
         if dense_j is None:
             cf_i, cf_j = context.direction(i)
             back_ni, back_confidence = self.run_head(context.layer, p2di_nj, cf_j, cf_i)
