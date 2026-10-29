@@ -20,12 +20,13 @@ def load_state_dict(weights: str, prefix: str) -> dict:
 
 
 def normalize_keypoints(kpts: torch.Tensor, size: torch.Tensor) -> torch.Tensor:
-    """Pixels (b, ..., 2) of a (w, h) image (b, 2), origin at the top-left corner, to [-1, 1]."""
+    """Normalize points (b, ..., 2) of a (w, h) image with size (b, 2), to [-1, 1]."""
     size = size.view(size.shape[0], *[1] * (kpts.dim() - 2), 2)
     return kpts / size * 2 - 1
 
 
 def denormalize_keypoints(kpts: torch.Tensor, size: torch.Tensor) -> torch.Tensor:
+    """Denormalize points (b, ..., 2) from [-1, 1] to pixels of a (w, h) image."""
     size = size.view(size.shape[0], *[1] * (kpts.dim() - 2), 2)
     return (kpts + 1) / 2 * size
 
@@ -101,7 +102,7 @@ def entmax15_window_readout(logits, grid, hw, radius: int = 1) -> tuple:
 
 
 def sq_dist_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Squared distances (B, M, N) of x (B, M, D) and y (B, N, D) in one GEMM, no sqrt passes."""
+    """Squared dist (B, M, N) of x (B, M, D) and y (B, N, D) in one GEMM, no sqrt."""
     ones_x, ones_y = x.new_ones(*x.shape[:-1], 1), y.new_ones(*y.shape[:-1], 1)
     xa = torch.cat([-2 * x, x.square().sum(-1, keepdim=True), ones_x], -1)
     ya = torch.cat([y, ones_y, y.square().sum(-1, keepdim=True)], -1)
@@ -133,7 +134,7 @@ def grid_sources(grid: torch.Tensor) -> torch.Tensor:
 
 
 def sample_cells(weights: torch.Tensor, n: int) -> tuple:
-    """At most n cells of (B, N) weights without replacement: indices (B, n), (B, n, 2)."""
+    """Sample at most n unique cells of (B, N) weights: indices (B, n), (B, n, 2)."""
     n = min(n, weights.shape[1])
     idx = torch.multinomial(weights.clamp_min(1e-12), n, replacement=False)
     return idx, idx[..., None].expand(-1, -1, 2)
