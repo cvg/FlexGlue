@@ -324,6 +324,28 @@ matcher = torch.hub.load("cvg/FlexGlue", "flexglue", trust_repo=True).eval().cud
 matcher = torch.hub.load("cvg/FlexGlue", "flexglue", trust_repo=True, refine=True)  # with arguments
 ```
 
+## ONNX export
+
+FlexGlue can be exported to [ONNX](https://onnx.ai/) and run with [ONNX Runtime](https://onnxruntime.ai/), without PyTorch. The export is split into two models:
+- [`flexglue_descriptor.onnx`](https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue_descriptor.onnx): `image (1, 3, 512, 512)` in [0, 1], squashed to 512x512 with a bilinear resize -> dense `features (1, 256, 64, 64)`. It runs once per image.
+- [`flexglue_matcher.onnx`](https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue_matcher.onnx) (or [`flexglue_matcher_fp16.onnx`](https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue_matcher_fp16.onnx) with float16 transformer layers, for CUDA): the sparse mode, which matches the keypoints of two images given their dense features. It returns `matches0`, `mscores0` and the `covisibility_score` of the pair. `filter_threshold`, `max_distance_px` and `min_covisibility` are inputs of the model and can be changed at runtime. Unlike in PyTorch, `max_distance_px = 0` rejects all matches: use `inf` to disable the check. Both images need at least one keypoint.
+
+The models are available in the [release](https://github.com/cvg/FlexGlue/releases/tag/v0.1) and are used by [COLMAP](https://github.com/colmap/colmap). [onnx/match_pair.py](onnx/match_pair.py) shows how to match two images with them, using only numpy, OpenCV and ONNX Runtime:
+```bash
+python -m pip install onnxruntime-gpu opencv-python  # or onnxruntime for CPU only
+python onnx/match_pair.py assets/berlin1.jpg assets/berlin2.jpg --output matches.png
+```
+
+To export the models yourself (requires `onnx` and `onnxscript`) and check them against PyTorch (also requires `onnxruntime`):
+```bash
+python onnx/export.py                        # descriptor + float32 matcher
+python onnx/export.py --fp16 --matcher_only  # float16 matcher
+python onnx/check.py --descriptor onnx/models/flexglue_descriptor.onnx \
+    --matcher onnx/models/flexglue_matcher.onnx
+```
+`onnx/check.py` can check any exported model, e.g. those of the release, against a PyTorch checkpoint (`--weights`).
+The exported matcher runs all transformer layers, without early stopping or refinement, and uses the fused attention operator of ONNX Runtime (`--no_fused_attention` exports standard ONNX operators instead).
+
 ## Checklist
 
 - [x] Publish the inference code
