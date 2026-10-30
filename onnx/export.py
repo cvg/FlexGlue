@@ -47,6 +47,14 @@ Likewise, the GELU activations of the matcher are exported as the
 com.microsoft::Gelu operator, a single kernel instead of five element-wise
 operators (Div, Erf, Add, Mul, Mul) that ONNX Runtime does not fuse.
 
+With --early_stop_layers (e.g. 2,4,6,8), the matcher stops early on pairs
+that are confidently not covisible, as FlexGlue.match(..., early_stop_decay=...):
+after each listed layer k, the pair is rejected without running the remaining
+layers and the readout if its covisibility score is below
+min_covisibility * (1 - early_stop_decay) ** (n_layers - k). The checks are ONNX
+If nodes built from per-layer covisibility-score outputs of the traced graph,
+and early_stop_decay is an additional scalar input (1 never stops early).
+
 Requires onnx and onnxscript.
 
 Usage (from the root of the repository):
@@ -70,6 +78,7 @@ import onnx
 import onnxscript
 import torch
 import torch.nn.functional as F
+from onnx import TensorProto, helper
 from onnx.defs import OpSchema
 from torch import nn
 
@@ -297,6 +306,230 @@ class SparseMatcherONNX(nn.Module):
         return outputs
 
 
+class LayerScoresMatcherONNX(SparseMatcherONNX):
+    """SparseMatcherONNX that also outputs the covisibility scores after layers.
+
+    Additional outputs covisibility_score_layer{k} for k in check_layers, used
+    to build the early-stopping graph (see add_early_stopping).
+    """
+
+    def __init__(self, matcher: FlexGlue, check_layers, fp16: bool = False):
+        super().__init__(matcher, fp16)
+        self.check_layers = tuple(check_layers)
+
+    def forward(
+        self,
+        features0: torch.Tensor,
+        features1: torch.Tensor,
+        kpts0: torch.Tensor,
+        kpts1: torch.Tensor,
+        image_size0: torch.Tensor,
+        image_size1: torch.Tensor,
+        filter_threshold: torch.Tensor,
+        max_distance_px: torch.Tensor,
+        min_covisibility: torch.Tensor,
+    ):
+        x0, x1, enc0, enc1 = self.tokens(features0, features1)
+        scores = []
+        for k, block in enumerate(self.matcher.transformers[: self.n_layers], 1):
+            x0, x1 = block(x0, x1, enc0, enc1)
+            if k in self.check_layers:
+                scores.append(self.matcher.covisibility_score(x0, x1, k))
+        outputs = self.match_tokens(
+            x0,
+            x1,
+            features0,
+            features1,
+            kpts0,
+            kpts1,
+            image_size0,
+            image_size1,
+            filter_threshold,
+            max_distance_px,
+            min_covisibility,
+        )
+        return (*outputs, *scores)
+
+
+def stage_node_indices(nodes, stage_outputs):
+    """Split the nodes into stages that compute each list of outputs in turn.
+
+    Stage i contains the indices of the nodes needed for stage_outputs[i] that
+    are not in an earlier stage, in topological order.
+    """
+    producer = {out: i for i, n in enumerate(nodes) for out in n.output}
+    stages, done = [], set()
+    for names in stage_outputs:
+        stage, stack = set(), [producer[n] for n in names if n in producer]
+        while stack:
+            i = stack.pop()
+            if i in stage or i in done:  # the ancestors of done are done
+                continue
+            stage.add(i)
+            stack.extend(producer[x] for x in nodes[i].input if x in producer)
+        done |= stage
+        stages.append(sorted(stage))
+    return stages
+
+
+def stage_initializers(graph, nodes, stages):
+    """Initializers of each stage: those first used by a node of the stage."""
+    first_stage = {}
+    for s, stage in enumerate(stages):
+        for i in stage:
+            for x in nodes[i].input:
+                first_stage.setdefault(x, s)
+    inits = [[] for _ in stages]
+    for init in graph.initializer:
+        if init.name in first_stage:
+            inits[first_stage[init.name]].append(init)
+    return inits
+
+
+def matcher_output_info(names):
+    """Value infos of outputs like MATCHER_OUTPUTS, with the given names."""
+    types = [TensorProto.INT64, TensorProto.FLOAT, TensorProto.FLOAT]
+    shapes = [[1, "num_keypoints0"], [1, "num_keypoints0"], [1]]
+    return [
+        helper.make_tensor_value_info(n, t, s) for n, t, s in zip(names, types, shapes)
+    ]
+
+
+def rename_values(nodes, rename):
+    """Rename the inputs and outputs of the nodes (in place)."""
+    for node in nodes:
+        for values in (node.input, node.output):
+            for j, x in enumerate(values):
+                values[j] = rename.get(x, x)
+    return nodes
+
+
+def reject_branch(prefix: str, score: str):
+    """Branch of a stop: no matches, and the score after the last layer run."""
+    shape = f"{prefix}_shape"
+    matches, mscores, covis = (f"{prefix}_{n}" for n in MATCHER_OUTPUTS)
+    nodes = [
+        helper.make_node("Shape", ["kpts0"], [shape], start=0, end=2),
+        helper.make_node(
+            "ConstantOfShape",
+            [shape],
+            [matches],
+            value=helper.make_tensor("v", TensorProto.INT64, [1], [-1]),
+        ),
+        helper.make_node(
+            "ConstantOfShape",
+            [shape],
+            [mscores],
+            value=helper.make_tensor("v", TensorProto.FLOAT, [1], [0.0]),
+        ),
+        helper.make_node("Identity", [score], [covis]),
+    ]
+    return helper.make_graph(
+        nodes, f"{prefix}_reject", [], matcher_output_info([matches, mscores, covis])
+    )
+
+
+def stop_condition(prefix: str, score: str, exponent: int):
+    """Nodes computing {prefix}_stop: whether the score is below the threshold
+    min_covisibility * (1 - early_stop_decay) ** exponent."""
+
+    def constant(name, value):
+        tensor = helper.make_tensor("v", TensorProto.FLOAT, [], [value])
+        return helper.make_node("Constant", [], [f"{prefix}_{name}"], value=tensor)
+
+    return [
+        constant("one", 1.0),
+        constant("exponent", float(exponent)),
+        helper.make_node(
+            "Sub", [f"{prefix}_one", "early_stop_decay"], [f"{prefix}_keep"]
+        ),
+        helper.make_node(
+            "Pow", [f"{prefix}_keep", f"{prefix}_exponent"], [f"{prefix}_gamma"]
+        ),
+        helper.make_node(
+            "Mul", ["min_covisibility", f"{prefix}_gamma"], [f"{prefix}_threshold"]
+        ),
+        helper.make_node("Less", [score, f"{prefix}_threshold"], [f"{prefix}_stop"]),
+    ]
+
+
+def early_stop_check(k: int, n_layers: int, outputs, continue_branch):
+    """Nodes that stop after layer k if its covisibility score is low, or else
+    run continue_branch (the remaining layers). Both produce the outputs."""
+    prefix, score = f"early_stop_layer{k}", f"covisibility_score_layer{k}"
+    if_node = helper.make_node(
+        "If",
+        [f"{prefix}_stop"],
+        outputs,
+        name=f"{prefix}_if",
+        then_branch=reject_branch(prefix, score),
+        else_branch=continue_branch,
+    )
+    return stop_condition(prefix, score, n_layers - k) + [if_node]
+
+
+def add_early_stopping(path: Path, check_layers, n_layers: int):
+    """Turn the graph of LayerScoresMatcherONNX into nested If nodes.
+
+    After each layer k in check_layers, the pair is rejected without running
+    the remaining layers and the readout if its covisibility score after layer
+    k is below min_covisibility * (1 - early_stop_decay) ** (n_layers - k), as
+    FlexGlue.match(..., early_stop_decay=...). The nodes are split into stages
+    (the nodes needed for the score after the first checked layer, those
+    needed in addition for the next one, ..., and the rest for the outputs),
+    and each stage after a check goes into the else-branch of an If node.
+    Adds the scalar input early_stop_decay: 1 never stops early (nor does
+    min_covisibility = 0). When stopping early, matches0 is -1, mscores0 is 0
+    and covisibility_score is the score of the last layer run.
+    """
+    model = onnx.load(str(path))
+    graph = model.graph
+    nodes = list(graph.node)
+    score_names = [f"covisibility_score_layer{k}" for k in check_layers]
+    final_names = [o.name for o in graph.output if o.name not in score_names]
+    assert final_names == MATCHER_OUTPUTS, final_names
+    stages = stage_node_indices(nodes, [[n] for n in score_names] + [final_names])
+    inits = stage_initializers(graph, nodes, stages)
+
+    # Build the nested Ifs from the innermost check to the outermost. The last
+    # stage produces renamed outputs, since the If node around it does.
+    outputs = [f"{n}_full" for n in final_names]
+    stage_nodes = rename_values(
+        [nodes[i] for i in stages[-1]], dict(zip(final_names, outputs))
+    )
+    graph_name = "layers_after_last_check"
+    for c in reversed(range(len(check_layers))):
+        body = helper.make_graph(
+            stage_nodes,
+            graph_name,
+            [],
+            matcher_output_info(outputs),
+            initializer=inits[c + 1],
+        )
+        k = check_layers[c]
+        outputs = (
+            final_names
+            if c == 0
+            else [f"{n}_after_layer{check_layers[c - 1]}" for n in final_names]
+        )
+        stage_nodes = [nodes[i] for i in stages[c]]
+        stage_nodes += early_stop_check(k, n_layers, outputs, body)
+        graph_name = f"layers_after_check{c}"
+
+    del graph.node[:]
+    graph.node.extend(stage_nodes)
+    del graph.initializer[:]
+    graph.initializer.extend(inits[0])
+    del graph.output[:]
+    graph.output.extend(matcher_output_info(final_names))
+    graph.input.append(
+        helper.make_tensor_value_info("early_stop_decay", TensorProto.FLOAT, [])
+    )
+    del graph.value_info[:]
+    onnx.checker.check_model(model)
+    onnx.save(model, str(path))
+
+
 def sha256sum(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -389,16 +622,24 @@ def export_matcher(
     fp16: bool = False,
     fused: bool = True,
     debug_outputs: bool = False,
+    early_stop_layers=None,
 ):
     """Export a copy of the matcher (the export modifies it in place)."""
     matcher = copy.deepcopy(matcher)
-    model = SparseMatcherONNX(matcher, fp16=fp16, debug_outputs=debug_outputs).eval()
+    output_names = MATCHER_OUTPUTS + (DEBUG_OUTPUTS if debug_outputs else [])
+    if early_stop_layers:
+        assert not debug_outputs
+        check_layers = sorted(early_stop_layers)
+        assert 1 <= check_layers[0] and check_layers[-1] < matcher.conf.n_layers
+        model = LayerScoresMatcherONNX(matcher, check_layers, fp16=fp16).eval()
+        output_names += [f"covisibility_score_layer{k}" for k in check_layers]
+    else:
+        model = SparseMatcherONNX(matcher, fp16, debug_outputs).eval()
     inputs = dummy_matcher_inputs(size)
     n0 = torch.export.Dim("num_keypoints0", min=2, max=65536)
     n1 = torch.export.Dim("num_keypoints1", min=2, max=65536)
     dynamic_shapes = {name: None for name in MATCHER_INPUTS}
     dynamic_shapes["kpts0"], dynamic_shapes["kpts1"] = {1: n0}, {1: n1}
-    output_names = MATCHER_OUTPUTS + (DEBUG_OUTPUTS if debug_outputs else [])
     with exportable(matcher, fused):
         torch.onnx.export(
             model,
@@ -418,6 +659,8 @@ def export_matcher(
             },
         )
     make_keypoint_dims_dynamic(path)
+    if early_stop_layers:
+        add_early_stopping(path, check_layers, matcher.conf.n_layers)
 
 
 def parse_args():
@@ -440,13 +683,23 @@ def parse_args():
         "GELU operators of ONNX Runtime.",
     )
     parser.add_argument(
+        "--early_stop_layers",
+        default="",
+        help="Comma-separated layers after which the matcher may stop early on "
+        "non-covisible pairs, e.g. 2,4,6,8 (adds the early_stop_decay input).",
+    )
+    parser.add_argument(
         "--matcher_only",
         action="store_true",
         help="Only export the matcher.",
     )
     args = parser.parse_args()
+    args.early_stop_layers = [int(k) for k in args.early_stop_layers.split(",") if k]
     args.matcher_name = (
-        "flexglue_matcher_fp16.onnx" if args.fp16 else "flexglue_matcher.onnx"
+        "flexglue_matcher"
+        + ("_early_stop" if args.early_stop_layers else "")
+        + ("_fp16" if args.fp16 else "")
+        + ".onnx"
     )
     return args
 
@@ -476,6 +729,7 @@ def main():
         args.opset,
         fp16=args.fp16,
         fused=not args.no_fused_attention,
+        early_stop_layers=args.early_stop_layers,
     )
     print_exported(path, t)
 

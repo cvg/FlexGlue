@@ -344,7 +344,13 @@ python onnx/check.py --descriptor onnx/models/flexglue_descriptor.onnx \
     --matcher onnx/models/flexglue_matcher.onnx
 ```
 `onnx/check.py` can check any exported model, e.g. those of the release, against a PyTorch checkpoint (`--weights`).
-The exported matcher runs all transformer layers, without early stopping or refinement, and uses the fused attention operator of ONNX Runtime (`--no_fused_attention` exports standard ONNX operators instead).
+The exported matcher has no refinement and uses the fused attention and GELU operators of ONNX Runtime (`--no_fused_attention` exports standard ONNX operators instead).
+By default, it runs all transformer layers. With `--early_stop_layers 2,4,6,8`, it stops early on pairs that are confidently not covisible, as `early_stop_decay` does in PyTorch:
+- After each listed layer `k`, it rejects the pair without running the remaining layers if its covisibility score is below `min_covisibility * (1 - early_stop_decay) ** (9 - k)`.
+- The checks are ONNX `If` nodes, and `early_stop_decay` is an additional input of the model. 1 never stops early.
+- On the exhaustive pairs of ETH3D with `min_covisibility=0.8` and `early_stop_decay=0.5`, this skips most of the computation of 42% of the pairs and practically never rejects a pair that would pass `min_covisibility` (0.08% of them).
+
+The matchers of the v0.1 release were exported at different stages: [`flexglue_matcher_early_stop.onnx`](https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue_matcher_early_stop.onnx) and [`flexglue_matcher_early_stop_fp16.onnx`](https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue_matcher_early_stop_fp16.onnx), used by COLMAP, with the fused GELU operator and `--early_stop_layers 2,4,6,8`; `flexglue_matcher{,_fp16}.onnx` earlier, without the fused GELU operator, which only changes the outputs by float rounding. Exporting the early-stopping matchers again with `export.py` gives the same graphs, but not byte-identical files, since the graphs also store the source location of each node.
 
 ## Checklist
 

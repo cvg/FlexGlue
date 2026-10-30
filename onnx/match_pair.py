@@ -47,6 +47,12 @@ MODELS = {
     "flexglue_matcher_fp16.onnx": (
         "f81cb68f27367171728c2c51ea5b60acab348520bc12154d4a3befa79f2dfe11"
     ),
+    "flexglue_matcher_early_stop.onnx": (
+        "c86714cd8ffac70c17ee48c346270497e21846831336e12d307390591aa12ea7"
+    ),
+    "flexglue_matcher_early_stop_fp16.onnx": (
+        "01286e692e6396cdfe6eaf5944d3af60752f5043275b338a6419a97efa339e20"
+    ),
 }
 
 
@@ -118,6 +124,7 @@ def match(
     filter_threshold: float = 0.1,
     max_distance_px: float = 3.0,
     min_covisibility: float = 0.0,
+    early_stop_decay: float = 0.5,
 ):
     """Match the keypoints of two images given their dense features.
 
@@ -136,6 +143,10 @@ def match(
             all matches (unlike in PyTorch, where 0 disables it).
         min_covisibility: reject all matches if the covisibility score of the
             pair is lower than this value (0 disables the check).
+        early_stop_decay: for matchers exported with --early_stop_layers,
+            reject the pair after layer k without running the remaining layers
+            if its covisibility score is below
+            min_covisibility * (1 - early_stop_decay) ** (9 - k).
 
     Returns:
         matches: (K, 2) indices into kpts0 and kpts1.
@@ -145,20 +156,20 @@ def match(
     """
     if len(kpts0) == 0 or len(kpts1) == 0:
         return np.zeros((0, 2), dtype=np.int64), np.zeros(0, np.float32), np.nan
-    matches0, mscores0, covisibility_score = session.run(
-        None,
-        {
-            "features0": features0,
-            "features1": features1,
-            "kpts0": kpts0[None].astype(np.float32),
-            "kpts1": kpts1[None].astype(np.float32),
-            "image_size0": np.array([image_size0], dtype=np.float32),
-            "image_size1": np.array([image_size1], dtype=np.float32),
-            "filter_threshold": np.array(filter_threshold, dtype=np.float32),
-            "max_distance_px": np.array(max_distance_px, dtype=np.float32),
-            "min_covisibility": np.array(min_covisibility, dtype=np.float32),
-        },
-    )
+    feeds = {
+        "features0": features0,
+        "features1": features1,
+        "kpts0": kpts0[None].astype(np.float32),
+        "kpts1": kpts1[None].astype(np.float32),
+        "image_size0": np.array([image_size0], dtype=np.float32),
+        "image_size1": np.array([image_size1], dtype=np.float32),
+        "filter_threshold": np.array(filter_threshold, dtype=np.float32),
+        "max_distance_px": np.array(max_distance_px, dtype=np.float32),
+        "min_covisibility": np.array(min_covisibility, dtype=np.float32),
+    }
+    if "early_stop_decay" in [i.name for i in session.get_inputs()]:
+        feeds["early_stop_decay"] = np.array(early_stop_decay, dtype=np.float32)
+    matches0, mscores0, covisibility_score = session.run(None, feeds)
     matches0, mscores0 = matches0[0], mscores0[0]
     valid = matches0 > -1
     matches = np.stack([np.flatnonzero(valid), matches0[valid]], -1)
@@ -199,6 +210,18 @@ def main():
     )
     parser.add_argument("--min_covisibility", type=float, default=0.0)
     parser.add_argument(
+        "--early_stop",
+        action="store_true",
+        help="Use the matcher that stops early on pairs that are confidently not "
+        "covisible (with --min_covisibility > 0).",
+    )
+    parser.add_argument(
+        "--early_stop_decay",
+        type=float,
+        default=0.5,
+        help="With --early_stop: lower values stop earlier (1 never stops early).",
+    )
+    parser.add_argument(
         "--model_dir",
         type=Path,
         default=Path.home() / ".cache/flexglue/onnx",
@@ -219,9 +242,10 @@ def main():
     if use_cuda:
         providers.insert(0, "CUDAExecutionProvider")
     matcher_name = (
-        "flexglue_matcher_fp16.onnx"
-        if use_cuda and not args.fp32
-        else "flexglue_matcher.onnx"
+        "flexglue_matcher"
+        + ("_early_stop" if args.early_stop else "")
+        + ("_fp16" if use_cuda and not args.fp32 else "")
+        + ".onnx"
     )
     print(f"ONNX Runtime {ort.__version__}, providers: {providers}")
     descriptor = ort.InferenceSession(
@@ -255,6 +279,7 @@ def main():
         filter_threshold=args.filter_threshold,
         max_distance_px=args.max_distance_px,
         min_covisibility=args.min_covisibility,
+        early_stop_decay=args.early_stop_decay,
     )
     print(
         f"{matcher_name}: {len(matches)} matches, covisibility score "
