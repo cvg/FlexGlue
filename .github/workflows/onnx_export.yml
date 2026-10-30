@@ -73,8 +73,13 @@ jobs:
             --matcher /tmp/flexglue_onnx/flexglue_matcher_early_stop.onnx
 
       # The early-stopping configuration of the released models, which COLMAP
-      # uses (export only).
+      # uses, also with a single keypoint per image.
       - name: Export the float32 matcher with early stopping after layers 2, 4, 6 and 8
         run: |
           python onnx/export.py --matcher_only --early_stop_layers 2,4,6,8 \
             --output_dir /tmp/flexglue_onnx_released
+
+      - name: Check the float32 matcher with early stopping after layers 2, 4, 6 and 8
+        run: |
+          python onnx/check.py --cpu --num_keypoints 1,512 \
+            --matcher /tmp/flexglue_onnx_released/flexglue_matcher_early_stop.onnx

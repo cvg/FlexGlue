@@ -1,8 +1,9 @@
 """Match two images with the FlexGlue ONNX models, using only ONNX Runtime.
 
-This example runs the sparse matcher exported by onnx/export.py, which is also
-used by COLMAP. It doesn't need PyTorch, only numpy, opencv-python and
-onnxruntime (or onnxruntime-gpu for CUDA).
+This example runs the sparse matcher exported by onnx/export.py, whose
+early-stopping variants (--early_stop) are used by COLMAP. It doesn't need
+PyTorch, only numpy, opencv-python and onnxruntime (or onnxruntime-gpu for
+CUDA).
 
 FlexGlue matches keypoints through dense image features, in two steps:
 1. Describe each image once: the image is resized (squashed) to the input

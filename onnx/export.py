@@ -636,6 +636,8 @@ def export_matcher(
     else:
         model = SparseMatcherONNX(matcher, fp16, debug_outputs).eval()
     inputs = dummy_matcher_inputs(size)
+    # torch.export specializes dimensions of size 0 and 1, hence min=2. The
+    # exported graph has no such constraint, and N = 1 is checked in the CI.
     n0 = torch.export.Dim("num_keypoints0", min=2, max=65536)
     n1 = torch.export.Dim("num_keypoints1", min=2, max=65536)
     dynamic_shapes = {name: None for name in MATCHER_INPUTS}
