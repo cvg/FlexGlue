@@ -88,7 +88,18 @@ class FlexGlue(nn.Module):
         mode: str = "reduce-overhead",
         static_lengths: Tuple[int, ...] = (512, 1024, 2048, 4096),
     ) -> "FlexGlue":
-        """Compile the transformer layers and heads, as LightGlue's compile."""
+        """Compile the encoder, transformer layers, heads and optional refiners."""
+        if self.descriptor is not None:
+            self.descriptor.forward = torch.compile(
+                self.descriptor.forward, mode="default", fullgraph=True
+            )
+        if self.refiner is not None:
+            self.refiner.features.forward = torch.compile(
+                self.refiner.features.forward, mode=mode, fullgraph=True
+            )
+            self.refiner.forward = torch.compile(
+                self.refiner.forward, mode=mode, fullgraph=True
+            )
         for block in self.transformers:  # dense tokens: fixed size, no masks
             block.forward = torch.compile(block.forward, mode=mode, fullgraph=True)
         for head in self.heads:  # queries padded to static_lengths, eager beyond
