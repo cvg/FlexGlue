@@ -18,6 +18,17 @@ def apply_rotary(enc: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     return t * enc[0] + rotate_half(t) * enc[1]
 
 
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Attention on token-major (B, N, H, D) tensors, returns (B, N, H * D).
+
+    A module-level function, so that exporters can swap in a fused operator.
+    """
+    out = F.scaled_dot_product_attention(  # flash
+        q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    )
+    return out.transpose(1, 2).flatten(-2)
+
+
 def mlp(dims: list) -> nn.Sequential:
     layers = []
     for i in range(1, len(dims)):
@@ -57,14 +68,36 @@ class SelfBlock(nn.Module):
         self.out_proj = nn.Linear(dim, dim)
         self.message_norm = nn.LayerNorm(dim)
         self.ffn = ffn(dim)
+        # rows of Wqkv ordered as (H, D, 3) (checkpoint) or (3, H, D) (blocked)
+        self.blocked_qkv = False
+
+    def use_blocked_qkv(self) -> None:
+        """Reorder the rows of Wqkv from (H, D, 3) to (3, H, D), same outputs.
+
+        q, k and v are then contiguous blocks instead of being interleaved along
+        the innermost axis, which some runtimes split much faster (e.g. ONNX
+        Runtime). The state_dict then has the reordered layout.
+        """
+        if self.blocked_qkv:
+            return
+        dim = self.Wqkv.out_features
+        perm = torch.arange(dim).view(self.num_heads, dim // (3 * self.num_heads), 3)
+        perm = perm.permute(2, 0, 1).reshape(-1)
+        with torch.no_grad():
+            self.Wqkv.weight.copy_(self.Wqkv.weight[perm])
+            self.Wqkv.bias.copy_(self.Wqkv.bias[perm])
+        self.blocked_qkv = True
 
     def forward(self, x: torch.Tensor, encoding: torch.Tensor) -> torch.Tensor:
-        qkv = self.Wqkv(x).unflatten(-1, (self.num_heads, -1, 3)).transpose(1, 2)
-        q, k, v = qkv[..., 0], qkv[..., 1], qkv[..., 2]
+        qkv = self.Wqkv(x)  # token-major (B, N, H, D) q, k, v
+        if self.blocked_qkv:
+            q, k, v = qkv.unflatten(-1, (3, self.num_heads, -1)).unbind(-3)
+        else:
+            q, k, v = qkv.unflatten(-1, (self.num_heads, -1, 3)).unbind(-1)
         q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
+        encoding = encoding.transpose(-3, -2)  # broadcast over (N, H) instead of (H, N)
         q, k = apply_rotary(encoding, q), apply_rotary(encoding, k)
-        context = F.scaled_dot_product_attention(q, k, v.contiguous())  # flash
-        message = self.out_proj(context.transpose(1, 2).flatten(-2))
+        message = self.out_proj(attention(q, k, v.contiguous()))
         return x + self.ffn(torch.cat([x, self.message_norm(message)], -1))
 
 
@@ -82,14 +115,13 @@ class CrossBlock(nn.Module):
     def forward(
         self, x0: torch.Tensor, x1: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        qk0, qk1, v0, v1 = (
-            t.unflatten(-1, (self.num_heads, -1)).transpose(1, 2)
+        qk0, qk1, v0, v1 = (  # token-major (B, N, H, D)
+            t.unflatten(-1, (self.num_heads, -1))
             for t in (self.to_qk(x0), self.to_qk(x1), self.to_v(x0), self.to_v(x1))
         )
         qk0, qk1 = self.qk_norm(qk0).to(v0.dtype), self.qk_norm(qk1).to(v1.dtype)
-        m0 = F.scaled_dot_product_attention(qk0, qk1, v1)
-        m1 = F.scaled_dot_product_attention(qk1, qk0, v0)
-        m0, m1 = (self.to_out(m.transpose(1, 2).flatten(-2)) for m in (m0, m1))
+        m0 = self.to_out(attention(qk0, qk1, v1))
+        m1 = self.to_out(attention(qk1, qk0, v0))
         x0 = x0 + self.ffn(torch.cat([x0, self.message_norm(m0)], -1))
         x1 = x1 + self.ffn(torch.cat([x1, self.message_norm(m1)], -1))
         return x0, x1
@@ -140,12 +172,17 @@ class MatchHead(nn.Module):
     """Regress the correspondence of each point in the other image's feature map."""
 
     def __init__(
-        self, dim: int, search_dim: int, query_chunk_size: int, cross: bool = True
+        self,
+        dim: int,
+        search_dim: int,
+        query_chunk_size: Optional[int],
+        cross: bool = True,
     ) -> None:
         super().__init__()
-        if not isinstance(query_chunk_size, int) or query_chunk_size <= 0:
+        valid = isinstance(query_chunk_size, int) and query_chunk_size > 0
+        if query_chunk_size is not None and not valid:
             raise ValueError(
-                f"query_chunk_size must be a positive int: {query_chunk_size}"
+                f"query_chunk_size must be a positive int or None: {query_chunk_size}"
             )
         self.query_chunk_size = query_chunk_size
         self.temperature = nn.Parameter(torch.tensor(10.0))
@@ -160,6 +197,8 @@ class MatchHead(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Normalized points (B, N, 2) of i -> predicted points in j and confidence."""
         search = F.normalize(self.to_search(cf_j.flatten(2).mT), dim=-1)
+        if self.query_chunk_size is None:  # all at once, e.g. for exporters
+            return self.match_points(points_ni, cf_i, cf_j, search)
         chunks = [  # bounds the (B, query_chunk_size, h * w) logits
             self.match_points(points, cf_i, cf_j, search)
             for points in points_ni.split(self.query_chunk_size, dim=1)
