@@ -43,6 +43,7 @@ class FlexGlue(nn.Module):
         "max_num_samples": 5000,  # matches sampled from the grids without keypoints
         "kde_balance": True,  # RoMa v2's kde balancing of the sampled matches
         "gemm_nn": True,  # sparse: mutual NN on summed squared distances, much faster
+        "exact_nn": False,  # gemm_nn: distances from differences, not one GEMM (exact)
         "query_chunk_size": 4096,  # points per correspondence-head call, bounds memory
         "weights": WEIGHTS_URL,
     }
@@ -152,7 +153,7 @@ class FlexGlue(nn.Module):
                 )
             pred[f"p2d{i}_n{j}"] = p2di_nj
             pred[f"p2d{i}_i{j}"] = ops.denormalize_keypoints(p2di_nj, size_j)
-            if conf.max_distance_px and cycle:
+            if cycle and ops.is_set(conf.max_distance_px):
                 error, back_confidence = self.cycle_error(
                     context,
                     i,
@@ -227,7 +228,9 @@ class FlexGlue(nn.Module):
             # the descriptor input frame, in which every distance and border is measured
             h, w = (self.stride * s for s in data_i["features"].shape[-2:])
             size = data_i["image_size"]
-            resized = torch.stack([size.new_full(size.shape[:1], s) for s in (w, h)], -1)
+            resized = torch.stack(
+                [size.new_full(size.shape[:1], s) for s in (w, h)], -1
+            )
             data_i = {**data_i, "resized_size": resized}
             out.append(data_i)
         return tuple(out)
@@ -235,7 +238,7 @@ class FlexGlue(nn.Module):
     def prepare_dense(
         self, context: PairContext, data0: dict, data1: dict, dirs: List[tuple], conf
     ) -> Dict[int, Dict[str, torch.Tensor]]:
-        """Refined grids by source image, both directions if the cycle check needs them."""
+        """Refined corresp. if refine is True, bidirectional under cycle check."""
         if not conf.refine:
             return {}
         if conf.max_distance_px:
@@ -274,19 +277,40 @@ class FlexGlue(nn.Module):
         tokens = torch.cat([x0, x1], 1).float()
         return torch.sigmoid(covisibility(tokens)).mean((1, 2))
 
+    def encode_pair(self, f0: torch.Tensor, f1: torch.Tensor) -> tuple:
+        """Input tokens (B, h * w, D) and positional encodings of both feature maps."""
+        enc0, enc1 = (
+            self.posenc(ops.cell_centers(*hw, scale=(max(hw),) * 2, device=f.device))
+            for f, hw in ((f0, f0.shape[-2:]), (f1, f1.shape[-2:]))
+        )
+        x0, x1 = self.input_proj(f0.flatten(2).mT), self.input_proj(f1.flatten(2).mT)
+        return x0, x1, enc0, enc1
+
+    def pair_context(
+        self,
+        x0: torch.Tensor,
+        x1: torch.Tensor,
+        hw: Tuple[tuple, tuple],
+        layer: int,
+        covisibility_score: Optional[torch.Tensor] = None,
+    ) -> PairContext:
+        """PairContext from the tokens after layer, float32 cross features."""
+        x0, x1 = x0.float(), x1.float()
+        if self.static_lengths is not None:  # own the tokens, not the graph's buffers
+            x0, x1 = x0.clone(), x1.clone()
+        if covisibility_score is None:
+            covisibility_score = self.covisibility_score(x0, x1, layer)
+        cf = (x0.mT.unflatten(-1, hw[0]), x1.mT.unflatten(-1, hw[1]))
+        return PairContext(layer, covisibility_score, cf)
+
     def decode_pair(
         self, data0: dict, data1: dict, conf: SimpleNamespace
     ) -> PairContext:
-        """Cross features and covisibility_score of the pair, refiner features if refine."""
+        """Cross features and covisibility_score of the pair (+ refine features)."""
         if self.static_lengths is not None:  # new CUDA graph step per pair
             torch.compiler.cudagraph_mark_step_begin()
         f0, f1 = data0["features"], data1["features"]
-        hw0, hw1 = f0.shape[-2:], f1.shape[-2:]
-        enc0, enc1 = (
-            self.posenc(ops.cell_centers(*hw, scale=(max(hw),) * 2, device=f0.device))
-            for hw in (hw0, hw1)
-        )
-        x0, x1 = self.input_proj(f0.flatten(2).mT), self.input_proj(f1.flatten(2).mT)
+        x0, x1, enc0, enc1 = self.encode_pair(f0, f1)
         layer, covisibility_score = conf.n_layers, None
         dtype = torch.float16 if conf.mp is None else getattr(torch, conf.mp)
         with torch.autocast(f0.device.type, dtype, enabled=conf.mp is not None):
@@ -300,13 +324,8 @@ class FlexGlue(nn.Module):
                 if (score < conf.min_covisibility * gamma).all():
                     layer, covisibility_score = k, score
                     break
-        x0, x1 = x0.float(), x1.float()
-        if self.static_lengths is not None:  # own the tokens, not the graph's buffers
-            x0, x1 = x0.clone(), x1.clone()
-        if covisibility_score is None:
-            covisibility_score = self.covisibility_score(x0, x1, layer)
-        cf = (x0.mT.unflatten(-1, hw0), x1.mT.unflatten(-1, hw1))
-        context = PairContext(layer, covisibility_score, cf)
+        hw = (f0.shape[-2:], f1.shape[-2:])
+        context = self.pair_context(x0, x1, hw, layer, covisibility_score)
         if conf.refine:
             fine = tuple(
                 self.refiner.extract(d["image"], resize=conf.refine_resize)
@@ -383,7 +402,7 @@ class FlexGlue(nn.Module):
     def sample_correspondences(
         self, dense: Dict[str, torch.Tensor], points_ni: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Read a grid at normalized points (B, N, 2): predicted points and confidence."""
+        """Read dense correspondences and confidence at normalized points (B, N, 2)."""
         p2di_nj = ops.sample_features(ops.to_chw(dense["dense_p2di_nj"]), points_ni)
         confidence = ops.sample_features(dense["dense_confidencei"][:, None], points_ni)
         return p2di_nj, confidence[..., 0]
@@ -397,7 +416,7 @@ class FlexGlue(nn.Module):
         size_i: torch.Tensor,
         dense_j: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Map p2di_nj back to i with the grid j -> i or the head: error in px, confidence."""
+        """Map p2di_nj back to i with the dense j->i warping or the head."""
         if dense_j is None:
             cf_i, cf_j = context.direction(i)
             back_ni, back_confidence = self.run_head(context.layer, p2di_nj, cf_j, cf_i)
@@ -418,7 +437,7 @@ class FlexGlue(nn.Module):
         """Pair, cycle and border checks on keypoints as valid{i}, in resized pixels."""
         data = (data0, data1)
         is_covisible = context.covisibility_score >= conf.min_covisibility
-        if conf.min_covisibility > 0:
+        if ops.is_set(conf.min_covisibility):
             pred["is_covisible"] = is_covisible
         for i, j in ((0, 1), (1, 0)):
             if f"confidence{i}" not in pred:
@@ -486,7 +505,8 @@ class FlexGlue(nn.Module):
             c0, c1 = size0[:, None] / 2, size1[:, None] / 2
             x = torch.cat([p2d0_i1 - c1, kpts0 - c0], -1)
             y = torch.cat([kpts1 - c1, p2d1_i0 - c0], -1)
-            m0, m1 = ops.mutual_nn(ops.sq_dist_gemm(x, y))
+            sq_dist = ops.sq_dist if conf.exact_nn else ops.sq_dist_gemm
+            m0, m1 = ops.mutual_nn(sq_dist(x, y))
 
             # exact mean distance of the selected pairs only
             def take(t: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
@@ -515,7 +535,7 @@ class FlexGlue(nn.Module):
         valid1 = (m1 > -1) & (scores1 >= conf.filter_threshold)
         valid0 &= pred["valid0"] & pred["valid1"].gather(1, m0.clamp(0))
         valid1 &= pred["valid1"] & pred["valid0"].gather(1, m1.clamp(0))
-        if conf.max_distance_px:
+        if ops.is_set(conf.max_distance_px):  # dist and scale average both images
             valid0 &= dist0 < conf.max_distance_px
             valid1 &= dist1 < conf.max_distance_px
         return {

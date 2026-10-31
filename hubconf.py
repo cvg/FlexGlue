@@ -1,4 +1,4 @@
-"""torch.hub entry points, e.g. torch.hub.load("cvg/FlexGlue", "flexglue", trust_repo=True)."""
+"""torch.hub entry points, e.g. torch.hub.load("cvg/FlexGlue", "flexglue")."""
 
 dependencies = ["torch", "numpy", "cv2"]
 

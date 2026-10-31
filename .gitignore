@@ -6,3 +6,4 @@ build/
 dist/
 .ipynb_checkpoints/
 .vscode/
+onnx/models/

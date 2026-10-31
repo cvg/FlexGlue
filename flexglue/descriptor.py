@@ -133,7 +133,7 @@ class DINOv3Descriptor(nn.Module):
         """Features of data["image"] (Images), descriptors at data["keypoints"]."""
         x = self.preprocess(data["image"], resize)
         pred = {
-            "features": self.head(self.backbone((x - self.mean) / self.std)),
+            "features": self.encode(x),
             "image_size": pp.image_sizes(data["image"]).to(x),
         }
         if self.conf.describe and "keypoints" in data:
@@ -141,6 +141,10 @@ class DINOv3Descriptor(nn.Module):
                 pred["features"], data["keypoints"], pred["image_size"]
             )
         return pred
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Dense features (B, C, h / 8, w / 8) of images already at the input size."""
+        return self.head(self.backbone((x - self.mean) / self.std))
 
     def preprocess(
         self, img: pp.Images, resize: Optional[pp.Resize] = None
