@@ -29,11 +29,11 @@ class FlexGlue(nn.Module):
         "n_layers": 9,
         "num_heads": 8,
         "filter_threshold": 0.1,  # min match confidence
-        "max_distance_px": 3.0,  # max cycle error, pixels of the descriptor input, per axis
+        "max_distance_px": 3.0,  # max cycle error, pixels of the descriptor input
         "min_covisibility": 0.0,  # invalidate all matches if covisibility_score is below
         "early_stop_decay": None,  # in [0, 1): decay per earlier layer (0: no decay)
-        "remove_border_px": 0.0,  # border margin, pixels of the descriptor input, per axis
-        "mp": "float16",  # transformer dtype: float16, bfloat16 or None (fp32), readout in fp32
+        "remove_border_px": 0.0,  # border margin, pixels of the descriptor input
+        "mp": "float16",  # transformer dtype: float16, bfloat16 or None (fp32)
         "describe": True,  # build a DINOv3Descriptor for inputs without features
         "describe_resize": (512, 512),  # descriptor input, as refine_resize
         "refine": False,  # refine with RoMa v2's dense refiners
@@ -427,14 +427,14 @@ class FlexGlue(nn.Module):
         return error, back_confidence
 
     def to_resized(self, points: torch.Tensor, data_i: dict) -> torch.Tensor:
-        """Points (B, ..., 2) from input pixels of image i to its descriptor input pixels."""
+        """Points (B, ..., 2) from pixels of image i to descriptor input pixels."""
         scale = data_i["resized_size"] / data_i["image_size"]
         return points * scale.view(scale.shape[0], *[1] * (points.dim() - 2), 2)
 
     def gate_points(
         self, pred: dict, context: PairContext, data0: dict, data1: dict, conf
     ) -> dict:
-        """Pair, cycle and border checks on keypoints as valid{i}, in resized pixels."""
+        """Pair, cycle and border checks on keypoints (valid{i}), in resized pixels."""
         data = (data0, data1)
         is_covisible = context.covisibility_score >= conf.min_covisibility
         if ops.is_set(conf.min_covisibility):
@@ -457,7 +457,7 @@ class FlexGlue(nn.Module):
     def gate_dense(
         self, pred: dict, context: PairContext, data0: dict, data1: dict, conf
     ) -> dict:
-        """Pair, filter, cycle and border gates on grid confidence, in resized pixels."""
+        """Pair, filter, cycle and border gates on grid confidence."""
         data = (data0, data1)
         is_covisible = context.covisibility_score >= conf.min_covisibility
         if conf.min_covisibility > 0:
@@ -495,7 +495,7 @@ class FlexGlue(nn.Module):
         return pred
 
     def sparse_matches(self, pred: dict, data0: dict, data1: dict, conf) -> dict:
-        """Mutual nearest neighbours of keypoints and predicted points, in resized pixels."""
+        """Mutual nearest neighbours of keypoints and predicted points."""
         size0, size1 = data0["resized_size"], data1["resized_size"]
         kpts0 = self.to_resized(data0["keypoints"], data0)
         kpts1 = self.to_resized(data1["keypoints"], data1)
