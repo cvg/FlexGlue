@@ -291,8 +291,16 @@ class SparseMatcherONNX(nn.Module):
                 "min_covisibility": min_covisibility,
             }
         )
-        data0 = {"features": features0, "keypoints": kpts0, "image_size": image_size0}
-        data1 = {"features": features1, "keypoints": kpts1, "image_size": image_size1}
+        inputs = ((features0, kpts0, image_size0), (features1, kpts1, image_size1))
+        data0, data1 = (
+            {
+                "features": f,
+                "keypoints": k,
+                "image_size": s,
+                "resized_size": m.resized_size(f, s),  # as describe_inputs
+            }
+            for f, k, s in inputs
+        )
         dirs = [(0, 1), (1, 0)]
         pred = m.keypoint_correspondences(context, data0, data1, dirs, conf, False)
         pred.update(m.sparse_matches(pred, data0, data1, conf))

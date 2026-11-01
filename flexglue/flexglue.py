@@ -225,15 +225,18 @@ class FlexGlue(nn.Module):
                     {"image": data_i["image"]}, resize=conf.describe_resize
                 )
                 data_i = {**described, **data_i}
-            # the descriptor input frame, in which every distance and border is measured
-            h, w = (self.stride * s for s in data_i["features"].shape[-2:])
-            size = data_i["image_size"]
-            resized = torch.stack(
-                [size.new_full(size.shape[:1], s) for s in (w, h)], -1
-            )
-            data_i = {**data_i, "resized_size": resized}
-            out.append(data_i)
+            resized = self.resized_size(data_i["features"], data_i["image_size"])
+            out.append({**data_i, "resized_size": resized})
         return tuple(out)
+
+    def resized_size(
+        self, features: torch.Tensor, image_size: torch.Tensor
+    ) -> torch.Tensor:
+        """(B, 2) w, h of the descriptor input, the frame of distances and borders."""
+        h, w = (self.stride * s for s in features.shape[-2:])
+        # filled on the device: new_tensor would block on a host-to-device copy
+        b = image_size.shape[:1]
+        return torch.stack([image_size.new_full(b, s) for s in (w, h)], -1)
 
     def prepare_dense(
         self, context: PairContext, data0: dict, data1: dict, dirs: List[tuple], conf
