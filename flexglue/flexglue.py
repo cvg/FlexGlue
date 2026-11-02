@@ -326,11 +326,15 @@ class FlexGlue(nn.Module):
         hw = (f0.shape[-2:], f1.shape[-2:])
         context = self.pair_context(x0, x1, hw, layer, covisibility_score)
         if conf.refine:
-            fine = tuple(
-                self.refiner.extract(d["image"], resize=conf.refine_resize)
-                for d in (data0, data1)
-            )
-            context = context._replace(fine=fine)
+            fine = []
+            for data in (data0, data1):
+                features = data.get("fine_features")
+                if features is None:
+                    features = self.refiner.extract(
+                        data["image"], resize=conf.refine_resize
+                    )
+                fine.append(features)
+            context = context._replace(fine=tuple(fine))
         return context
 
     def run_head(
