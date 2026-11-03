@@ -29,10 +29,10 @@ class FlexGlue(nn.Module):
         "n_layers": 9,
         "num_heads": 8,
         "filter_threshold": 0.1,  # min match confidence
-        "max_distance_px": 3.0,  # max cycle error, pixels of the resized image
+        "max_distance_px": 3.0,  # max cycle error, pixels of the descriptor input
         "min_covisibility": 0.0,  # invalidate matches if covisibility_score is below
         "early_stop_decay": None,  # in [0, 1): decay per earlier layer (0: no decay)
-        "remove_border_px": 0.0,  # border margin, pixels of the resized image
+        "remove_border_px": 0.0,  # border margin, pixels of the descriptor input
         "mp": "float16",  # transformer dtype: float16, bfloat16 or None (fp32)
         "describe": True,  # build a DINOv3Descriptor for inputs without features
         "describe_resize": (512, 512),  # descriptor input, as refine_resize
@@ -166,7 +166,12 @@ class FlexGlue(nn.Module):
             pred[f"p2d{i}_i{j}"] = ops.denormalize_keypoints(p2di_nj, size_j)
             if cycle and ops.is_set(conf.max_distance_px):
                 error, back_confidence = self.cycle_error(
-                    context, i, kpts_ni, p2di_nj, size_i, dense.get(j)
+                    context,
+                    i,
+                    kpts_ni,
+                    p2di_nj,
+                    data[i]["resized_size"],
+                    dense.get(j),
                 )
                 pred[f"cycle_error{i}"] = error
                 # geometric mean of the forward and backward confidence
@@ -231,8 +236,18 @@ class FlexGlue(nn.Module):
                     {"image": data_i["image"]}, resize=conf.describe_resize
                 )
                 data_i = {**described, **data_i}
-            out.append(data_i)
+            resized = self.resized_size(data_i["features"], data_i["image_size"])
+            out.append({**data_i, "resized_size": resized})
         return tuple(out)
+
+    def resized_size(
+        self, features: torch.Tensor, image_size: torch.Tensor
+    ) -> torch.Tensor:
+        """(B, 2) w, h of the descriptor input, the frame of distances and borders."""
+        h, w = (self.stride * s for s in features.shape[-2:])
+        # filled on the device: new_tensor would block on a host-to-device copy
+        b = image_size.shape[:1]
+        return torch.stack([image_size.new_full(b, s) for s in (w, h)], -1)
 
     def prepare_dense(
         self, context: PairContext, data0: dict, data1: dict, dirs: List[tuple], conf
@@ -429,32 +444,31 @@ class FlexGlue(nn.Module):
         error = (back_ii - ops.denormalize_keypoints(points_ni, size_i)).norm(dim=-1)
         return error, back_confidence
 
-    def pixel_scale(self, data_i: dict) -> torch.Tensor:
-        """Image pixels per resized pixel (B,), long side of image / resized image."""
-        resized_side = self.stride * max(data_i["features"].shape[-2:])
-        return data_i["image_size"].max(-1).values / resized_side
+    def to_resized(self, points: torch.Tensor, data_i: dict) -> torch.Tensor:
+        """Points (B, ..., 2) from pixels of image i to descriptor input pixels."""
+        scale = data_i["resized_size"] / data_i["image_size"]
+        return points * scale.view(scale.shape[0], *[1] * (points.dim() - 2), 2)
 
     def gate_points(
         self, pred: dict, context: PairContext, data0: dict, data1: dict, conf
     ) -> dict:
-        """Pair, cycle and border checks on keypoints as valid{i}."""
+        """Pair, cycle and border checks on keypoints (valid{i}), in resized pixels."""
         data = (data0, data1)
-        scale = (self.pixel_scale(data0), self.pixel_scale(data1))
         is_covisible = context.covisibility_score >= conf.min_covisibility
         if ops.is_set(conf.min_covisibility):
             pred["is_covisible"] = is_covisible
         for i, j in ((0, 1), (1, 0)):
             if f"confidence{i}" not in pred:
                 continue
-            size_i, size_j = data[i]["image_size"], data[j]["image_size"]
-            border_i = conf.remove_border_px * scale[i]
-            border_j = conf.remove_border_px * scale[j]
+            size_i, size_j = data[i]["resized_size"], data[j]["resized_size"]
+            border = size_i.new_full(size_i.shape[:1], conf.remove_border_px)
+            kpts_ri = self.to_resized(data[i]["keypoints"], data[i])
+            p2di_rj = self.to_resized(pred[f"p2d{i}_i{j}"], data[j])
             valid = is_covisible[:, None]
-            valid = valid & ops.inside_border(data[i]["keypoints"], size_i, border_i)
-            valid &= ops.inside_border(pred[f"p2d{i}_i{j}"], size_j, border_j)
-            if f"cycle_error{i}" in pred:
-                max_error = conf.max_distance_px * scale[i][:, None]
-                valid &= pred[f"cycle_error{i}"] < max_error
+            valid = valid & ops.inside_border(kpts_ri, size_i, border)
+            valid &= ops.inside_border(p2di_rj, size_j, border)
+            if f"cycle_error{i}" in pred:  # in resized pixels of image i
+                valid &= pred[f"cycle_error{i}"] < conf.max_distance_px
             pred[f"valid{i}"] = valid
         return pred
 
@@ -463,24 +477,23 @@ class FlexGlue(nn.Module):
     ) -> dict:
         """Pair, filter, cycle and border gates on grid confidence."""
         data = (data0, data1)
-        scale = (self.pixel_scale(data0), self.pixel_scale(data1))
         is_covisible = context.covisibility_score >= conf.min_covisibility
         if conf.min_covisibility > 0:
             pred["is_covisible"] = is_covisible
         for i, j in ((0, 1), (1, 0)):
             if f"dense_confidence{i}" not in pred:
                 continue
-            size_i, size_j = data[i]["image_size"], data[j]["image_size"]
-            border_i = conf.remove_border_px * scale[i]
-            border_j = conf.remove_border_px * scale[j]
+            size_i, size_j = data[i]["resized_size"], data[j]["resized_size"]
+            border = size_i.new_full(size_i.shape[:1], conf.remove_border_px)
             dense_p2di_nj = pred[f"dense_p2d{i}_n{j}"]
             dense_confidence = pred[f"dense_confidence{i}"]
             dense_p2di_ni = ops.grid_sources(dense_p2di_nj)
-            dense_p2di_ii = ops.denormalize_keypoints(dense_p2di_ni, size_i)
+            dense_p2di_ri = ops.denormalize_keypoints(dense_p2di_ni, size_i)
+            dense_p2di_rj = self.to_resized(pred[f"dense_p2d{i}_i{j}"], data[j])
             valid = is_covisible[:, None, None]
             valid = valid & (dense_confidence >= conf.filter_threshold)
-            valid &= ops.inside_border(dense_p2di_ii, size_i, border_i)
-            valid &= ops.inside_border(pred[f"dense_p2d{i}_i{j}"], size_j, border_j)
+            valid &= ops.inside_border(dense_p2di_ri, size_i, border)
+            valid &= ops.inside_border(dense_p2di_rj, size_j, border)
             if conf.max_distance_px:
                 dense_j = {
                     "dense_p2di_nj": pred[f"dense_p2d{j}_n{i}"],
@@ -494,18 +507,20 @@ class FlexGlue(nn.Module):
                     size_i,
                     dense_j,
                 )[0]
-                max_error = conf.max_distance_px * scale[i][:, None, None]
-                valid &= err.view_as(dense_confidence) < max_error
+                valid &= err.view_as(dense_confidence) < conf.max_distance_px
             pred[f"dense_valid{i}"] = valid
             pred[f"dense_confidence{i}"] = torch.where(valid, dense_confidence, 0)
         return pred
 
     def sparse_matches(self, pred: dict, data0: dict, data1: dict, conf) -> dict:
         """Mutual nearest neighbours of keypoints and predicted points."""
-        kpts0, kpts1 = data0["keypoints"], data1["keypoints"]
-        p2d0_i1, p2d1_i0 = pred["p2d0_i1"], pred["p2d1_i0"]
+        size0, size1 = data0["resized_size"], data1["resized_size"]
+        kpts0 = self.to_resized(data0["keypoints"], data0)
+        kpts1 = self.to_resized(data1["keypoints"], data1)
+        p2d0_i1 = self.to_resized(pred["p2d0_i1"], data1)
+        p2d1_i0 = self.to_resized(pred["p2d1_i0"], data0)
         if conf.gemm_nn:  # centered on each image for float32 precision
-            c0, c1 = (d["image_size"][:, None] / 2 for d in (data0, data1))
+            c0, c1 = size0[:, None] / 2, size1[:, None] / 2
             x = torch.cat([p2d0_i1 - c1, kpts0 - c0], -1)
             y = torch.cat([kpts1 - c1, p2d1_i0 - c0], -1)
             sq_dist = ops.sq_dist if conf.exact_nn else ops.sq_dist_gemm
@@ -539,10 +554,8 @@ class FlexGlue(nn.Module):
         valid0 &= pred["valid0"] & pred["valid1"].gather(1, m0.clamp(0))
         valid1 &= pred["valid1"] & pred["valid0"].gather(1, m1.clamp(0))
         if ops.is_set(conf.max_distance_px):  # dist and scale average both images
-            scale = (self.pixel_scale(data0) + self.pixel_scale(data1)) / 2
-            max_dist = conf.max_distance_px * scale[:, None]
-            valid0 &= dist0 < max_dist
-            valid1 &= dist1 < max_dist
+            valid0 &= dist0 < conf.max_distance_px
+            valid1 &= dist1 < conf.max_distance_px
         return {
             "matches0": torch.where(valid0, m0, -1),
             "matches1": torch.where(valid1, m1, -1),
