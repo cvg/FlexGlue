@@ -282,9 +282,9 @@ class FlexGlue(nn.Module):
         with torch.autocast(f0.device.type, dtype, enabled=conf.mp is not None):
             for k, block in enumerate(self.transformers[: conf.n_layers], 1):
                 x0, x1 = block(x0, x1, enc0, enc1)
-                if conf.early_stop_decay is None or k == conf.n_layers:
+                if conf.early_stop_decay is None or k in (1, conf.n_layers):
                     continue
-                # stop once the whole batch is a confident non-pair (host sync)
+                # stop after layer >= 2 on a confident non-pair batch (host sync)
                 score = self.covisibility_score(x0, x1, k)
                 gamma = (1 - conf.early_stop_decay) ** (len(self.transformers) - k)
                 if (score < conf.min_covisibility * gamma).all():
