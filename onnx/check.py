@@ -13,8 +13,8 @@ ONNX Runtime, early stopping) and the input resolution are read from the
 models. A matcher with early stopping is compared with early_stop_decay=1,
 which never stops early. If it checks the covisibility score after every layer
 but the first and the last, as FlexGlue does (export with --early_stop_layers
-2,...,8), it is also compared with early stopping, for early_stop_decay in EARLY_STOP_DECAYS.
-Otherwise, the outputs with early stopping are only printed.
+2,...,8), it is also compared with early stopping, for early_stop_decay in
+EARLY_STOP_DECAYS. Otherwise, the outputs with early stopping are only printed.
 
 Requires onnx, onnxscript and onnxruntime (onnxruntime-gpu on GPU).
 
