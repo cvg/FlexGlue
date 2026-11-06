@@ -12,9 +12,9 @@ The options of the matcher (float16 transformer layers, fused operators of
 ONNX Runtime, early stopping) and the input resolution are read from the
 models. A matcher with early stopping is compared with early_stop_decay=1,
 which never stops early. If it checks the covisibility score after every layer
-but the last, as FlexGlue does (export with --early_stop_layers 1,...,8), it is
-also compared with early stopping, for early_stop_decay in EARLY_STOP_DECAYS.
-Otherwise, the outputs with early stopping are only printed.
+but the first and the last, as FlexGlue does (export with --early_stop_layers
+2,...,8), it is also compared with early stopping, for early_stop_decay in
+EARLY_STOP_DECAYS. Otherwise, the outputs with early stopping are only printed.
 
 Requires onnx, onnxscript and onnxruntime (onnxruntime-gpu on GPU).
 
@@ -331,8 +331,8 @@ def check_early_stop(session, matcher, features, kpts, feeds, decay, tol):
 
 
 def print_early_stop(session, feeds, early_stop_decay: float):
-    """Outputs with early stopping, not compared: the graph checks fewer layers
-    than FlexGlue, which checks every layer but the last."""
+    """Outputs with early stopping, not compared: the graph checks other layers
+    than FlexGlue, which checks every layer but the first and the last."""
     feeds = {**feeds, "early_stop_decay": np.array(early_stop_decay, np.float32)}
     matches0, _, covisibility_score = session.run(None, feeds)
     print(
@@ -415,7 +415,7 @@ def main():
         sessions.debug = debug_session(models.matcher, options, providers)
         sessions.early_stop = options.early_stop
         sessions.early_stop_comparable = options.early_stop_layers == list(
-            range(1, models.matcher.conf.n_layers)
+            range(2, models.matcher.conf.n_layers)
         )
         models.matcher = models.matcher.to(device)
     if len(sizes) > 1:
