@@ -191,7 +191,7 @@ Outputs of `matcher(...)` and `matcher.match(...)`, for each direction `i -> j` 
 - `p2d{i}_n{j}`: `(B, M, 2)` the same, in normalized coordinates `[-1, 1]`.
 - `confidence{i}`: `(B, M)` confidence that the keypoint has a correspondence. With the cycle check, the geometric mean of the forward confidence and the confidence of the prediction mapped back to `i`.
 - `valid{i}`: `(B, M)` whether the keypoint passes the covisibility, border and cycle checks.
-- `cycle_error{i}`: `(B, M)` cycle error in pixels, with `max_distance_px` and not `sparse=True`.
+- `cycle_error{i}`: `(B, M)` cycle error in pixels of the resized image `i` (the descriptor input), with `max_distance_px` and not `sparse=True`.
 - `covisibility_score`: `(B,)` probability that the two images show the same place.
 - `stop_layer`: the layer at which the matcher stopped.
 
@@ -272,14 +272,15 @@ Batching has a few requirements:
 `FlexGlue`:
 - ```n_layers```: Number of transformer layers, fewer is faster but less accurate. Default: 9 (all).
 - ```filter_threshold```: Minimum match confidence. Default: 0.1.
-- ```max_distance_px```: Maximum cycle error, or mutual nearest-neighbor distance in sparse mode, in pixels of the resized image. None disables it. Default: 3.0.
+- ```max_distance_px```: Maximum cycle error, or mutual nearest-neighbor distance in sparse mode, in pixels of the resized image (the descriptor input). None disables it. Default: 3.0.
 - ```min_covisibility```: Reject all matches of pairs with a lower ```covisibility_score```, e.g. 0.8 for noisy image sets. Default: 0.0 (off).
 - ```early_stop_decay```: Stop after layer ```k``` if ```covisibility_score < min_covisibility * (1 - early_stop_decay) ** (9 - k)```, lower stops earlier. Default: None (off). Never stop after first layer.
 - ```remove_border_px```: Drop matches this close to the border, in pixels of the resized image. Default: 0.0.
 - ```mp```: Transformer mixed precision: ```"float16"```, ```"bfloat16"``` or ```None``` (float32). Default: ```"float16"```.
 - ```describe_resize```: Input size of the built-in descriptor, as ```resize``` above. Default: (512, 512).
 - ```gemm_nn```: Sparse mode: mutual nearest neighbors in one matrix multiplication, faster for many keypoints. Default: True.
-- ```query_chunk_size```: Points per correspondence-head call, bounds memory without changing results. Default: 4096.
+- ```exact_nn```: With ```gemm_nn```, compute the squared distances from coordinate differences instead of one matrix multiplication: slower but exact, also where float32 matrix multiplications run in TF32. Default: False.
+- ```query_chunk_size```: Points per correspondence-head call, bounds memory without changing results. None processes all points at once. Default: 4096.
 - ```weights```: Path or URL of the weights. Default: the release weights.
 - ```coarse_stride```: Grid pitch of ```match_dense``` and the sampled mode, in pixels of the resized image (4 doubles the resolution). Default: 8.
 - ```max_num_samples```: Maximum number of sampled matches without keypoints. Default: 5000.
@@ -322,6 +323,34 @@ import torch
 matcher = torch.hub.load("cvg/FlexGlue", "flexglue", trust_repo=True).eval().cuda()
 matcher = torch.hub.load("cvg/FlexGlue", "flexglue", trust_repo=True, refine=True)  # with arguments
 ```
+
+## ONNX export
+
+FlexGlue can be exported to [ONNX](https://onnx.ai/) and run with [ONNX Runtime](https://onnxruntime.ai/), without PyTorch. The export is split into two models:
+- [`flexglue_descriptor.onnx`](https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue_descriptor.onnx): `image (1, 3, 512, 512)` in [0, 1], squashed to 512x512 with a bilinear resize -> dense `features (1, 256, 64, 64)`. It runs once per image.
+- [`flexglue_matcher.onnx`](https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue_matcher.onnx) (or [`flexglue_matcher_fp16.onnx`](https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue_matcher_fp16.onnx) with float16 transformer layers, for CUDA): the sparse mode, which matches the keypoints of two images given their dense features. It returns `matches0`, `mscores0` and the `covisibility_score` of the pair. `filter_threshold`, `max_distance_px` and `min_covisibility` are inputs of the model and can be changed at runtime. Unlike in PyTorch, `max_distance_px = 0` rejects all matches: use `inf` to disable the check. Both images need at least one keypoint.
+
+The models are available in the [release](https://github.com/cvg/FlexGlue/releases/tag/v0.1) and are used by [COLMAP](https://github.com/colmap/colmap). [onnx/match_pair.py](onnx/match_pair.py) shows how to match two images with them, using only numpy, OpenCV and ONNX Runtime:
+```bash
+python -m pip install onnxruntime-gpu opencv-python  # or onnxruntime for CPU only
+python onnx/match_pair.py assets/berlin1.jpg assets/berlin2.jpg --output matches.png
+```
+
+To export the models yourself (requires `onnx` and `onnxscript`) and check them against PyTorch (also requires `onnxruntime`):
+```bash
+python onnx/export.py                        # descriptor + float32 matcher
+python onnx/export.py --fp16 --matcher_only  # float16 matcher
+python onnx/check.py --descriptor onnx/models/flexglue_descriptor.onnx \
+    --matcher onnx/models/flexglue_matcher.onnx
+```
+`onnx/check.py` can check any exported model, e.g. those of the release, against a PyTorch checkpoint (`--weights`).
+The exported matcher has no refinement and uses the fused attention and GELU operators of ONNX Runtime (`--no_fused_attention` exports standard ONNX operators instead).
+By default, it runs all transformer layers. With `--early_stop_layers 2,4,6,8`, it stops early on pairs that are confidently not covisible, as `early_stop_decay` does in PyTorch:
+- After each listed layer `k`, it rejects the pair without running the remaining layers if its covisibility score is below `min_covisibility * (1 - early_stop_decay) ** (9 - k)`.
+- The checks are ONNX `If` nodes, and `early_stop_decay` is an additional input of the model. 1 never stops early.
+- On the exhaustive pairs of ETH3D with `min_covisibility=0.8` and `early_stop_decay=0.5`, this skips most of the computation of 42% of the pairs and practically never rejects a pair that would pass `min_covisibility` (0.08% of them).
+
+The matchers of the v0.1 release were exported at different stages: [`flexglue_matcher_early_stop.onnx`](https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue_matcher_early_stop.onnx) and [`flexglue_matcher_early_stop_fp16.onnx`](https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue_matcher_early_stop_fp16.onnx), used by COLMAP, with the fused GELU operator and `--early_stop_layers 2,4,6,8`; `flexglue_matcher{,_fp16}.onnx` earlier, without the fused GELU operator, which only changes the outputs by float rounding. Exporting the early-stopping matchers again with `export.py` gives the same graphs, but not byte-identical files, since the graphs also store the source location of each node.
 
 ## Checklist
 

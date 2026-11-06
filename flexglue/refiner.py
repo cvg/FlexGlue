@@ -5,7 +5,7 @@ Adapted from the official implementation and weights:
     Johan Edstedt, David Nordström, Yushan Zhang, Georg Bökman, Jonathan Astermark,
     Viktor Larsson, Anders Heyden, Fredrik Kahl, Mårten Wadenbäck, Michael Felsberg
     ECCV 2026, https://arxiv.org/abs/2511.15706
-    Code: https://github.com/Parskatt/RoMaV2 (MIT License, Copyright (c) 2025 Johan Edstedt)
+    Code: https://github.com/Parskatt/RoMaV2 (MIT License)
 """
 
 from typing import Dict, Optional, Tuple
@@ -26,7 +26,7 @@ def bhwc_interpolate(x: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
 def local_correlation(
     f0: torch.Tensor, f1: torch.Tensor, warp: torch.Tensor, radius: int
 ) -> torch.Tensor:
-    """Correlate f0 (b, c, h, w) with f1 in a (2r+1)^2 window around warp (b, h, w, 2)."""
+    """Corr. f0 (b, c, h, w) with f1 in a (2r+1)^2 window around warp (b, h, w, 2)."""
     b, c, h, w = f0.shape
     r = torch.linspace(-2 * radius, 2 * radius, 2 * radius + 1, device=f0.device)
     dy, dx = torch.meshgrid(r / h, r / w, indexing="ij")
@@ -151,7 +151,7 @@ class ConvRefiner(nn.Module):
 class RoMav2Refiner(nn.Module):
     url = "https://github.com/Parskatt/RoMaV2/releases/download/v2.0.1/romav2.0.1.pt"
     anchor = 512  # RoMa's displacement embedding is scaled relative to 512 x 512
-    # stride: (feature dim, projection dim, displacement embedding dim, correlation radius)
+    # stride: (feature dim, projection dim, displacement embed dim, correlation radius)
     configs = {4: (256, 192, 79, 3), 2: (128, 48, 23, 1), 1: (64, 12, 8, None)}
 
     def __init__(self, scales: Tuple[int, ...] = (4, 2, 1), weights: str = url) -> None:
@@ -182,7 +182,7 @@ class RoMav2Refiner(nn.Module):
         gridi_nj: torch.Tensor,
         mlogit_i: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Refine a coarse grid (b, hc, wc, 2) with logits (b, hc, wc) to refine size."""
+        """Refine coarse grid (b, hc, wc, 2) with logits (b, hc, wc) to refine size."""
         h, w = feats_i[1].shape[1:3]
         scale_factor = (w / self.anchor, h / self.anchor)
         mlogit_i = mlogit_i[..., None]

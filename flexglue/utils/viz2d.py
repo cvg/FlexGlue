@@ -1,4 +1,4 @@
-"""Plotting adapted from LightGlue's viz2d (Apache-2.0), with points in corner coordinates."""
+"""Plotting adapted from LightGlue (Apache-2.0), with points in corner coordinates."""
 
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -98,7 +98,7 @@ def plot_matches(
     a: float = 1.0,
     axes: Optional[Tuple[plt.Axes, plt.Axes]] = None,
 ) -> None:
-    """Matches (N, 2) in corner coordinates between the two plotted images, gradient colors if no color."""
+    """Matches (N, 2) in corner coordinates between the two plotted images."""
     fig = plt.gcf()
     ax0, ax1 = fig.axes[:2] if axes is None else axes
     kpts0, kpts1 = to_numpy(kpts0), to_numpy(kpts1)
