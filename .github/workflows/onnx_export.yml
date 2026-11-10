@@ -60,12 +60,12 @@ jobs:
             --descriptor /tmp/flexglue_onnx/flexglue_descriptor.onnx \
             --matcher /tmp/flexglue_onnx/flexglue_matcher.onnx
 
-      # Check after every layer but the last, as FlexGlue does, so that
-      # check.py also compares the outputs with early stopping.
+      # Check after every layer but the first and the last, as FlexGlue does,
+      # so that check.py also compares the outputs with early stopping.
       - name: Export the float32 matcher with early stopping
         run: |
           python onnx/export.py --matcher_only \
-            --early_stop_layers 1,2,3,4,5,6,7,8 --output_dir /tmp/flexglue_onnx
+            --early_stop_layers 2,3,4,5,6,7,8 --output_dir /tmp/flexglue_onnx
 
       - name: Check the float32 matcher with early stopping
         run: |
