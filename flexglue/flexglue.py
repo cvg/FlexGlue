@@ -1,5 +1,6 @@
 """FlexGlue: Sparse-to-Dense Matching and Visual Disambiguation."""
 
+from numbers import Integral
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
@@ -62,6 +63,15 @@ class FlexGlue(nn.Module):
         super().__init__()
         self.conf = conf = SimpleNamespace(**{**self.default_conf, **conf})
         d, h = conf.descriptor_dim, conf.num_heads
+        if any(
+            isinstance(v, bool) or not isinstance(v, Integral) or v <= 0 for v in (d, h)
+        ):
+            raise ValueError("descriptor_dim and num_heads must be positive integers.")
+        d, h = int(d), int(h)
+        if conf.n_layers > 0 and d % (2 * h):
+            raise ValueError(
+                "Attention requires descriptor_dim divisible by 2 * num_heads."
+            )
         self.input_proj = nn.Linear(conf.input_dim, d)
         self.posenc = LearnableFourierPositionalEncoding(2, d // h)
         self.transformers = nn.ModuleList(
