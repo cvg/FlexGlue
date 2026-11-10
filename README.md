@@ -272,7 +272,7 @@ Batching has a few requirements:
 `FlexGlue`:
 - ```n_layers```: Number of transformer layers, fewer is faster but less accurate. Default: 9 (all).
 - ```filter_threshold```: Minimum match confidence. Default: 0.1.
-- ```max_distance_px```: Maximum cycle error, or mutual nearest-neighbor distance in sparse mode, in pixels of the resized image (the descriptor input). None disables it. Default: 3.0.
+- ```max_distance_px```: Maximum cycle error, or mutual nearest-neighbor distance in sparse mode, in pixels of the resized image (the descriptor input). Use `None` or a non-positive Python number to disable it. Default: 3.0.
 - ```min_covisibility```: Reject all matches of pairs with a lower ```covisibility_score```, e.g. 0.8 for noisy image sets. Default: 0.0 (off).
 - ```early_stop_decay```: Stop after layer ```k``` if ```covisibility_score < min_covisibility * (1 - early_stop_decay) ** (9 - k)```, lower stops earlier. Default: None (off). Never stop after first layer.
 - ```remove_border_px```: Drop matches this close to the border, in pixels of the resized image (as ```max_distance_px```). Default: 0.0.
