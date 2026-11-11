@@ -582,17 +582,9 @@ class FlexGlue(nn.Module):
 
     def sample_matches(self, pred: dict, data0: dict, data1: dict, conf) -> dict:
         """max_num_samples cells of both gated grids, by confidence or kde balance."""
-        data, kpts0, kpts1, scores = (data0, data1), [], [], []
-        for i, j in ((0, 1), (1, 0)):
-            dense_p2di_ij = pred[f"dense_p2d{i}_i{j}"]
-            dense_p2di_ii = ops.denormalize_keypoints(
-                ops.grid_sources(dense_p2di_ij), data[i]["image_size"]
-            )
-            pair = [dense_p2di_ii.flatten(1, 2), dense_p2di_ij.flatten(1, 2)]
-            kpts0.append(pair[i])
-            kpts1.append(pair[j])
-            scores.append(pred[f"dense_confidence{i}"].flatten(1))  # 0 where gated out
-        kpts0, kpts1, scores = (torch.cat(x, 1) for x in (kpts0, kpts1, scores))
+        scores = torch.cat(
+            [pred[f"dense_confidence{i}"].flatten(1) for i in (0, 1)], 1
+        )  # 0 where gated out
         weights = scores
         if conf.kde_balance:
             weights = ops.kde_weights(
@@ -601,6 +593,17 @@ class FlexGlue(nn.Module):
                 scores,
                 conf.max_num_samples,
             )
+        # Endpoints are not consumed by KDE; keep them out of its live peak.
+        data, kpts0, kpts1 = (data0, data1), [], []
+        for i, j in ((0, 1), (1, 0)):
+            dense_p2di_ij = pred[f"dense_p2d{i}_i{j}"]
+            dense_p2di_ii = ops.denormalize_keypoints(
+                ops.grid_sources(dense_p2di_ij), data[i]["image_size"]
+            )
+            pair = [dense_p2di_ii.flatten(1, 2), dense_p2di_ij.flatten(1, 2)]
+            kpts0.append(pair[i])
+            kpts1.append(pair[j])
+        kpts0, kpts1 = (torch.cat(x, 1) for x in (kpts0, kpts1))
         idx, idx_xy = ops.sample_cells(weights, conf.max_num_samples)
         return ops.identity_matches(
             kpts0.gather(1, idx_xy),
