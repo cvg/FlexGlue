@@ -278,8 +278,9 @@ Batching has a few requirements:
 - ```remove_border_px```: Drop matches this close to the border, in pixels of the resized image (as ```max_distance_px```). Default: 0.0.
 - ```mp```: Transformer mixed precision: ```"float16"```, ```"bfloat16"``` or ```None``` (float32). Default: ```"float16"```.
 - ```describe_resize```: Input size of the built-in descriptor, as ```resize``` above. Default: (512, 512).
-- ```gemm_nn```: Sparse mode: mutual nearest neighbors in one matrix multiplication, faster for many keypoints. Default: True.
+- ```gemm_nn```: Sparse mode: mutual nearest neighbors in one matrix multiplication, faster for many keypoints. Default: True. GEMM and exact paths select by summed squared endpoint errors; the fallback selects by mean endpoint distance. Both threshold the mean endpoint distance.
 - ```exact_nn```: With ```gemm_nn```, compute the squared distances from coordinate differences instead of one matrix multiplication: slower but exact, also where float32 matrix multiplications run in TF32. Default: False.
+- ```readout_backend```: Optional eager CUDA entmax threshold fusion: ```"torch"``` or ```"triton"```. Fixed at construction; default: ```"torch"```.
 - ```query_chunk_size```: Points per correspondence-head call, bounds memory without changing results. None processes all points at once. Default: 4096.
 - ```weights```: Path or URL of the weights. Default: the release weights.
 - ```coarse_stride```: Grid pitch of ```match_dense``` and the sampled mode, in pixels of the resized image (4 doubles the resolution). Default: 8.
@@ -313,6 +314,8 @@ FlexGlue can be compiled with `torch.compile`, as LightGlue:
 matcher = FlexGlue().eval().cuda().compile(mode="reduce-overhead")
 ```
 The transformer layers and the correspondence heads are compiled into CUDA graphs. Keypoints are padded to the next of `static_lengths` (512, 1024, 2048, 4096 by default), larger inputs fall back to eager mode. The first calls of each new input size are slow while compiling.
+
+`FlexGlue(readout_backend="triton")` requires Triton and optionally fuses eager CUDA FP32 entmax threshold arithmetic for eligible 512-value rows. Torch still performs cumulative sums and window readout. Unsupported inputs, gradients, tracing, export, and compiled heads use the native threshold. The default does not import Triton.
 
 ## torch.hub
 

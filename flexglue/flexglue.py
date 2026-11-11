@@ -1,5 +1,6 @@
 """FlexGlue: Sparse-to-Dense Matching and Visual Disambiguation."""
 
+from functools import partial
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
@@ -38,6 +39,7 @@ class FlexGlue(nn.Module):
         "describe_resize": (512, 512),  # descriptor input, as refine_resize
         "refine": False,  # refine with RoMa v2's dense refiners
         "refine_resize": (512, 512),  # refiner input, int: long side, (h, w): squash
+        "readout_backend": "torch",  # optional eager threshold fusion: "triton"
         "refine_scales": (2, 1),  # RoMa refiner strides, coarse to fine
         "coarse_stride": 8,  # coarse grid pitch, pixels of the resized image (8: cells)
         "max_num_samples": 5000,  # matches sampled from the grids without keypoints
@@ -50,6 +52,7 @@ class FlexGlue(nn.Module):
     fixed_conf = (
         "weights",
         "refine_scales",
+        "readout_backend",
         "query_chunk_size",
         "input_dim",
         "descriptor_dim",
@@ -61,6 +64,13 @@ class FlexGlue(nn.Module):
     def __init__(self, **conf) -> None:
         super().__init__()
         self.conf = conf = SimpleNamespace(**{**self.default_conf, **conf})
+        if conf.readout_backend not in ("torch", "triton"):
+            raise ValueError("readout_backend must be 'torch' or 'triton'.")
+        threshold = ops.sorted_entmax15_threshold
+        if conf.readout_backend == "triton":
+            from .utils.entmax_triton import threshold as fused_threshold
+
+            threshold = partial(fused_threshold, native=threshold)
         d, h = conf.descriptor_dim, conf.num_heads
         self.input_proj = nn.Linear(conf.input_dim, d)
         self.posenc = LearnableFourierPositionalEncoding(2, d // h)
@@ -70,7 +80,13 @@ class FlexGlue(nn.Module):
         # heads[k] reads the features after k transformer layers, heads[0] the raw ones
         self.heads = nn.ModuleList(
             [
-                MatchHead(d, conf.search_dim, conf.query_chunk_size, cross=k > 0)
+                MatchHead(
+                    d,
+                    conf.search_dim,
+                    conf.query_chunk_size,
+                    cross=k > 0,
+                    threshold=threshold,
+                )
                 for k in range(conf.n_layers + 1)
             ]
         )

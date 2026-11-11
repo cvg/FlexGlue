@@ -60,6 +60,8 @@ def sample_features(features: torch.Tensor, pts: torch.Tensor) -> torch.Tensor:
 
 def sorted_entmax15_threshold(ys: torch.Tensor) -> torch.Tensor:
     """Exact 1.5-entmax threshold from scores sorted in descending order."""
+    if ys.dtype in (torch.float16, torch.bfloat16):
+        ys = ys.float()
     rho = torch.arange(1, ys.shape[-1] + 1, device=ys.device, dtype=ys.dtype)
     mean = ys.cumsum(-1) / rho
     mean_sq = ys.square().cumsum(-1) / rho
@@ -85,26 +87,45 @@ def entmax15_threshold(
     return tau
 
 
-def entmax15_window_readout(logits, grid, hw, radius: int = 1, k: int = 512) -> tuple:
+def entmax15_window_readout(
+    logits,
+    grid,
+    hw,
+    radius: int = 1,
+    k: int = 512,
+    *,
+    threshold=sorted_entmax15_threshold,
+) -> tuple:
     """1.5-entmax expected position (B, N, 2) and mass (B, N) around the argmax."""
+    low_precision = logits.dtype in (torch.float16, torch.bfloat16)
     if logits.shape[-1] > k:  # maximum and threshold from the same (sorted) top-k
         topv, topi = logits.topk(k, dim=-1)
         vmax, idx = topv[..., :1], topi[..., :1]
-        y = (logits - vmax) / 2
-        tau = sorted_entmax15_threshold((topv - vmax) / 2)
+        values = topv.float() if low_precision else topv
+        max_value = vmax.float() if low_precision else vmax
+        tau = threshold((values - max_value) / 2)
     else:
         vmax, idx = logits.max(-1, keepdim=True)
-        y = (logits - vmax) / 2
-        tau = entmax15_threshold(y, k)
+        values = logits.float() if low_precision else logits
+        max_value = vmax.float() if low_precision else vmax
+        tau = entmax15_threshold((values - max_value) / 2, k)
     h, w = hw
-    r = torch.arange(-radius, radius + 1, device=y.device)
+    r = torch.arange(-radius, radius + 1, device=logits.device)
     ny = (idx // w)[..., None] + r[:, None]
     nx = (idx % w)[..., None] + r[None, :]
     inside = ((ny >= 0) & (ny < h) & (nx >= 0) & (nx < w)).flatten(-2)
     nidx = (ny.clamp(0, h - 1) * w + nx.clamp(0, w - 1)).flatten(-2)
-    p = (y.gather(-1, nidx) - tau).clamp_min(0).square()  # entmax sums to 1
+    window = logits.gather(-1, nidx)
+    if low_precision:
+        window = window.float()
+    window = (window - max_value) / 2
+    p = (window - tau).clamp_min(0).square()  # entmax sums to 1
     position = (p[..., None] * grid[nidx]).sum(-2) / p.sum(-1, keepdim=True)
-    return position, (p * inside).sum(-1)  # clamped border cells count once
+    mass = (p * inside).sum(-1)  # clamped border cells count once
+    if low_precision:
+        position = position.to(torch.promote_types(logits.dtype, grid.dtype))
+        mass = mass.to(logits.dtype)
+    return position, mass
 
 
 def sq_dist_gemm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -122,9 +143,12 @@ def sq_dist(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     run in TF32 (e.g. ONNX Runtime on CUDA by default). One coordinate at a time,
     without (B, M, N, D) intermediates.
     """
-    return sum(
-        (x[..., i, None] - y[..., i][:, None]).square() for i in range(x.shape[-1])
-    )
+    if x.shape[-1] == 0:  # Preserve the empty sum of the original implementation.
+        return 0
+    dist = (x[..., 0, None] - y[..., 0][:, None]).square()
+    for i in range(1, x.shape[-1]):
+        dist.add_((x[..., i, None] - y[..., i][:, None]).square())
+    return dist
 
 
 def is_set(threshold) -> bool:

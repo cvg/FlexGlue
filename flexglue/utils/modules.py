@@ -177,6 +177,7 @@ class MatchHead(nn.Module):
         search_dim: int,
         query_chunk_size: Optional[int],
         cross: bool = True,
+        threshold=ops.sorted_entmax15_threshold,
     ) -> None:
         super().__init__()
         valid = isinstance(query_chunk_size, int) and query_chunk_size > 0
@@ -185,6 +186,7 @@ class MatchHead(nn.Module):
                 f"query_chunk_size must be a positive int or None: {query_chunk_size}"
             )
         self.query_chunk_size = query_chunk_size
+        self.threshold = threshold
         self.temperature = nn.Parameter(torch.tensor(10.0))
         self.to_search = nn.Linear(dim, search_dim)
         # layer 0 sees no cross-view context: no matchability, no covisibility
@@ -221,7 +223,9 @@ class MatchHead(nn.Module):
         query = F.normalize(self.to_search(f_query), dim=-1)
         logits = query @ search.mT * self.temperature
         grid = ops.cell_centers(*hw, scale=(hw[1], hw[0]), device=logits.device)
-        p2di_nj, window_mass = ops.entmax15_window_readout(logits, grid, hw)
+        p2di_nj, window_mass = ops.entmax15_window_readout(
+            logits, grid, hw, threshold=self.threshold
+        )
         f_match = ops.sample_features(cf_j, p2di_nj)
         p2di_nj = p2di_nj + self.offset_head(f_query, f_match, hw)
         if self.matchability is None:
