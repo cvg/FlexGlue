@@ -1,0 +1,295 @@
+{
+  "schema": "flexglue.rgb8-benchmark/v1",
+  "parentCommit": "ee99f7c0a6ea2445e74188943c8d4b7b8471fb46",
+  "measurement": "warm cached endpoint graph, decode/upload/descriptor/matching/final CUDA drain",
+  "order": [
+    "control",
+    "candidate",
+    "candidate",
+    "control"
+  ],
+  "observationsPerArm": 2,
+  "hardware": {
+    "torchCpuThreads": 12,
+    "cpuModel": "not recorded by this court",
+    "gpu": "NVIDIA GeForce RTX 3080 Ti"
+  },
+  "runtime": {
+    "numpy": "2.5.3",
+    "torch": "2.14.1+cu132",
+    "cuda": "13.2",
+    "opencv": "5.0.0",
+    "triton": "3.8.0"
+  },
+  "settings": {
+    "descriptorGrid": [
+      512,
+      512
+    ],
+    "seed": 42,
+    "layers": 9,
+    "refine": false,
+    "descriptorPrecision": "float32",
+    "matcherPrecision": "default float16 autocast, float32 readout",
+    "staticLengths": [
+      4096
+    ],
+    "edgeCount": 12,
+    "mmapWeights": false,
+    "endpointCount": 11,
+    "fieldsPerEdge": 16,
+    "samples": 2048
+  },
+  "results": [
+    {
+      "imageCap": 1536,
+      "control": {
+        "observations": 2,
+        "meanWallSeconds": 1.2296704809414223,
+        "meanCpuSeconds": 1.2389831210000004,
+        "meanOfRunSampledRssMeansMiB": 2386.1322790357,
+        "maxRunSampledRssPeakMiB": 2508.6953125,
+        "meanOfRunSampledRssPeaksMiB": 2450.884765625,
+        "meanOfRunAllocatedPeaksMiB": 707.9345703125,
+        "reservedPeaksMiB": [
+          1004,
+          1004
+        ],
+        "processLifetimeMaxRssMiB": [
+          2557.30078125,
+          2557.30078125
+        ]
+      },
+      "candidate": {
+        "observations": 2,
+        "meanWallSeconds": 1.124453643511515,
+        "meanCpuSeconds": 1.1338651265000017,
+        "meanOfRunSampledRssMeansMiB": 2369.422549715909,
+        "maxRunSampledRssPeakMiB": 2375.07421875,
+        "meanOfRunSampledRssPeaksMiB": 2375.07421875,
+        "meanOfRunAllocatedPeaksMiB": 693.93505859375,
+        "reservedPeaksMiB": [
+          1004,
+          1004
+        ],
+        "processLifetimeMaxRssMiB": [
+          2557.30078125,
+          2557.30078125
+        ]
+      },
+      "delta": {
+        "allocatedPeakDeltaMiB": -13.99951171875,
+        "sampledMeanRssDeltaMiB": -16.709729319790767,
+        "cpuDeltaSeconds": -0.1051179944999987,
+        "cpuPercent": -8.48421521797299,
+        "wallDeltaSeconds": -0.10521683742990717,
+        "wallPercent": -8.556506727668566
+      },
+      "rawObservations": [
+        {
+          "kind": "control",
+          "wallSeconds": 1.2243110339622945,
+          "cpuSeconds": 1.235193829,
+          "peakAllocatedBytes": 742323200,
+          "peakReservedBytes": 1052770304,
+          "reservedInterpretation": "shared-process allocator-history highwater; not arm-isolated",
+          "rssStartKiB": 2568900,
+          "rssMeanKiB": 2444790.7107438017,
+          "rssPeakKiB": 2568904,
+          "rssEndKiB": 2450508,
+          "processLifetimeMaxRssKiB": 2618676
+        },
+        {
+          "kind": "candidate",
+          "wallSeconds": 1.118072543060407,
+          "cpuSeconds": 1.1255506230000023,
+          "peakAllocatedBytes": 727643648,
+          "peakReservedBytes": 1052770304,
+          "reservedInterpretation": "shared-process allocator-history highwater; not arm-isolated",
+          "rssStartKiB": 2395340,
+          "rssMeanKiB": 2420501.381818182,
+          "rssPeakKiB": 2432076,
+          "rssEndKiB": 2432076,
+          "processLifetimeMaxRssKiB": 2618676
+        },
+        {
+          "kind": "candidate",
+          "wallSeconds": 1.1308347439626232,
+          "cpuSeconds": 1.1421796300000011,
+          "peakAllocatedBytes": 727643648,
+          "peakReservedBytes": 1052770304,
+          "reservedInterpretation": "shared-process allocator-history highwater; not arm-isolated",
+          "rssStartKiB": 2432076,
+          "rssMeanKiB": 2432076,
+          "rssPeakKiB": 2432076,
+          "rssEndKiB": 2432076,
+          "processLifetimeMaxRssKiB": 2618676
+        },
+        {
+          "kind": "control",
+          "wallSeconds": 1.23502992792055,
+          "cpuSeconds": 1.2427724130000009,
+          "peakAllocatedBytes": 742323200,
+          "peakReservedBytes": 1052770304,
+          "reservedInterpretation": "shared-process allocator-history highwater; not arm-isolated",
+          "rssStartKiB": 2432076,
+          "rssMeanKiB": 2442008.1967213117,
+          "rssPeakKiB": 2450508,
+          "rssEndKiB": 2395340,
+          "processLifetimeMaxRssKiB": 2618676
+        }
+      ],
+      "parity": {
+        "endpointFeaturesExact": true,
+        "pixelsExact": true,
+        "edgeAndEndRngExact": true,
+        "all16OutputFieldsExact": true
+      }
+    },
+    {
+      "imageCap": 3072,
+      "control": {
+        "observations": 2,
+        "meanWallSeconds": 2.8304388135438785,
+        "meanCpuSeconds": 2.857011976500001,
+        "meanOfRunSampledRssMeansMiB": 2476.4329230780895,
+        "maxRunSampledRssPeakMiB": 2608.57421875,
+        "meanOfRunSampledRssPeaksMiB": 2599.57421875,
+        "meanOfRunAllocatedPeaksMiB": 761.9345703125,
+        "reservedPeaksMiB": [
+          1076,
+          1076
+        ],
+        "processLifetimeMaxRssMiB": [
+          2672.94140625,
+          2672.94140625
+        ]
+      },
+      "candidate": {
+        "observations": 2,
+        "meanWallSeconds": 2.166810062539298,
+        "meanCpuSeconds": 2.1838401439999977,
+        "meanOfRunSampledRssMeansMiB": 2459.388989903687,
+        "maxRunSampledRssPeakMiB": 2518.5703125,
+        "meanOfRunSampledRssPeaksMiB": 2518.5703125,
+        "meanOfRunAllocatedPeaksMiB": 707.81005859375,
+        "reservedPeaksMiB": [
+          1076,
+          1076
+        ],
+        "processLifetimeMaxRssMiB": [
+          2672.94140625,
+          2672.94140625
+        ]
+      },
+      "delta": {
+        "allocatedPeakDeltaMiB": -54.12451171875,
+        "sampledMeanRssDeltaMiB": -17.043933174402355,
+        "cpuDeltaSeconds": -0.6731718325000031,
+        "cpuPercent": -23.56209347517948,
+        "wallDeltaSeconds": -0.6636287510045804,
+        "wallPercent": -23.44614368023301
+      },
+      "rawObservations": [
+        {
+          "kind": "control",
+          "wallSeconds": 2.861386422999203,
+          "cpuSeconds": 2.8854579220000005,
+          "peakAllocatedBytes": 798946304,
+          "peakReservedBytes": 1128267776,
+          "reservedInterpretation": "shared-process allocator-history highwater; not arm-isolated",
+          "rssStartKiB": 2556604,
+          "rssMeanKiB": 2544108.953736655,
+          "rssPeakKiB": 2671180,
+          "rssEndKiB": 2468552,
+          "processLifetimeMaxRssKiB": 2737092
+        },
+        {
+          "kind": "candidate",
+          "wallSeconds": 2.1962878620252013,
+          "cpuSeconds": 2.2111532749999974,
+          "peakAllocatedBytes": 742192640,
+          "peakReservedBytes": 1128267776,
+          "reservedInterpretation": "shared-process allocator-history highwater; not arm-isolated",
+          "rssStartKiB": 2468552,
+          "rssMeanKiB": 2518961.8703703703,
+          "rssPeakKiB": 2579016,
+          "rssEndKiB": 2579016,
+          "processLifetimeMaxRssKiB": 2737092
+        },
+        {
+          "kind": "candidate",
+          "wallSeconds": 2.137332263053395,
+          "cpuSeconds": 2.156527012999998,
+          "peakAllocatedBytes": 742192640,
+          "peakReservedBytes": 1128267776,
+          "reservedInterpretation": "shared-process allocator-history highwater; not arm-isolated",
+          "rssStartKiB": 2468552,
+          "rssMeanKiB": 2517866.780952381,
+          "rssPeakKiB": 2579016,
+          "rssEndKiB": 2579016,
+          "processLifetimeMaxRssKiB": 2737092
+        },
+        {
+          "kind": "control",
+          "wallSeconds": 2.799491204088554,
+          "cpuSeconds": 2.828566031000001,
+          "peakAllocatedBytes": 798946304,
+          "peakReservedBytes": 1128267776,
+          "reservedInterpretation": "shared-process allocator-history highwater; not arm-isolated",
+          "rssStartKiB": 2468552,
+          "rssMeanKiB": 2527625.672727273,
+          "rssPeakKiB": 2652748,
+          "rssEndKiB": 2579016,
+          "processLifetimeMaxRssKiB": 2737092
+        }
+      ],
+      "parity": {
+        "endpointFeaturesExact": true,
+        "pixelsExact": true,
+        "edgeAndEndRngExact": true,
+        "all16OutputFieldsExact": true
+      }
+    }
+  ],
+  "limitations": [
+    "One GPU and a fixed graph; two timed observations per arm.",
+    "Allocated values are means of process-local Torch peaks, not average or whole-device VRAM.",
+    "RSS values are sampled shared-process values affected by allocator history/order; sample counts unavailable.",
+    "Reserved values include shared-process allocator history, not arm-isolated memory.",
+    "Setup, compile/capture warmup and callable compatibility qualification are excluded from graph clocks.",
+    "No cold-start, native Windows, refiner numerical or backward-gradient claim.",
+    "No combined mmap_weights=true/RGB8 performance claim."
+  ],
+  "counterAvailability": {
+    "torchReservedPeak": true,
+    "wholeDevicePhysicalVram": false,
+    "gpuUtilization": false,
+    "torchAllocatedPeak": true,
+    "rssSampleCount": false,
+    "reconstructionGeometryQuality": false,
+    "backwardGradientValues": false,
+    "energy": false,
+    "sampledRss": true,
+    "gpuKernelCounters": false,
+    "processWall": true,
+    "processCpuSeconds": true,
+    "cacheMisses": false,
+    "cpuInstructions": false
+  },
+  "qualification": {
+    "independentOriginalGraphs": 2,
+    "contractRecords": 34,
+    "backwardOnRealBackbone": false,
+    "nativeWindowsQualified": false,
+    "refinerNumericsQualified": false,
+    "pairedNumericalRngCases": 28
+  },
+  "memoryInterpretation": {
+    "reserved": "Shared-process allocator-history highwater, not arm-isolated;1004MiB/1076MiB unchanged.",
+    "processLifetimeRss": "Lifetime highwater includes setup/warmup/correctness and is not arm-attributable.",
+    "rss": "Each run samples process RSS nominally every10ms; arm mean is unweighted mean of two run sample means; max is maximum sampled peak acrossN2. Sample counts unavailable; shared-process memory history/order affects values.",
+    "setup": "Single per-resolution candidate model construction/eval/CUDA-placement/compile-wrapper observation after imports/runtime init; actual capture/warmup excluded. No paired startup result.",
+    "allocated": "Mean of two Torch process-local allocated peaks, not time-average and not whole-device physical VRAM."
+  }
+}

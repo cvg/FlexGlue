@@ -1,6 +1,8 @@
+import sys
 from types import SimpleNamespace
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -118,6 +120,7 @@ class DINOv3Descriptor(nn.Module):
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406])[:, None, None])
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225])[:, None, None])
 
+        self.register_buffer("_rgb8_codebook", None, persistent=False)
         state_dict = ops.load_state_dict(conf.weights, "extractor.")
         sub = lambda p: {  # noqa: E731
             k.removeprefix(p): v for k, v in state_dict.items() if k.startswith(p)
@@ -129,8 +132,26 @@ class DINOv3Descriptor(nn.Module):
         self.descriptor_head = nn.Linear(*descriptor_head["weight"].shape[::-1])
         self.descriptor_head.load_state_dict(descriptor_head)
 
+    def _apply(self, fn, *args, **kwargs):
+        # A half->float round trip can corrupt a codebook even when its final
+        # dtype is FP32. Any module transform invalidates this derived cache.
+        self._rgb8_codebook = None
+        return super()._apply(fn, *args, **kwargs)
+
     def forward(self, data: dict, resize: Optional[pp.Resize] = None) -> dict:
-        """Features of data["image"] (Images), descriptors at data["keypoints"]."""
+        """Features of images, with optional byte preparation before tensor work."""
+        if "rgb8_backend" in data and isinstance(data["image"], np.ndarray):
+            return self._forward_rgb8(
+                data["image"],
+                data.get("keypoints"),
+                resize,
+                backend=data["rgb8_backend"],
+                host_sampling=data.get("rgb8_host_sampling", False),
+            )
+        return self._forward(data, resize)
+
+    def _forward(self, data: dict, resize: Optional[pp.Resize] = None) -> dict:
+        """Shared tensor forward, including the compiled descriptor path."""
         x = self.preprocess(data["image"], resize)
         pred = {
             "features": self.encode(x),
@@ -152,6 +173,125 @@ class DINOv3Descriptor(nn.Module):
         """Resize and stack images to the input resolution, conf.resize if None."""
         resize = self.conf.resize if resize is None else resize
         return pp.resize_images(img, resize, self.edge_divisible_by)
+
+    _stock_preprocess = preprocess
+
+    @property
+    def pixel_dtype(self) -> torch.dtype:
+        """Input precision before resize, matching the normalization buffers."""
+        return self.mean.dtype
+
+    def rgb8_to_tensor(self, image: np.ndarray) -> torch.Tensor:
+        """Normalize byte pixels on the descriptor's device and input precision."""
+        return pp.numpy_image_to_torch(image).to(
+            device=self.mean.device, dtype=self.pixel_dtype
+        )
+
+    def describe_rgb8(
+        self,
+        image: np.ndarray,
+        keypoints: Optional[torch.Tensor] = None,
+        resize: Optional[pp.Resize] = None,
+        *,
+        backend: str = "torch",
+        host_sampling: bool = False,
+    ) -> dict:
+        """Describe HWC byte input through the same public forward dispatch."""
+        data = {
+            "image": image,
+            "rgb8_backend": backend,
+            "rgb8_host_sampling": host_sampling,
+        }
+        if keypoints is not None:
+            data["keypoints"] = keypoints
+        return self.forward(data, resize)
+
+    def _forward_rgb8(
+        self,
+        image: np.ndarray,
+        keypoints: Optional[torch.Tensor] = None,
+        resize: Optional[pp.Resize] = None,
+        *,
+        backend: str = "torch",
+        host_sampling: bool = False,
+    ) -> dict:
+        """Describe HWC RGB8 with an optional CUDA preparation backend.
+
+        The caller must not mutate image during the blocking upload. Unsupported
+        inputs and inference settings use the original Torch preprocessing.
+        Byte input uses the normalization buffers' dtype before resizing.
+        """
+        if not isinstance(host_sampling, bool):
+            raise ValueError("host_sampling must be a bool")
+        if backend not in ("torch", "torch-compile", "triton"):
+            raise ValueError("backend must be 'torch', 'torch-compile' or 'triton'.")
+        if (
+            not isinstance(image, np.ndarray)
+            or image.dtype != np.uint8
+            or image.ndim != 3
+            or image.shape[2] != 3
+        ):
+            raise ValueError("describe_rgb8 expects an HWC RGB8 NumPy image")
+        resize = self.conf.resize if resize is None else resize
+        device = self.mean.device
+        pixel_dtype = self.pixel_dtype
+        supported = (
+            pixel_dtype == torch.float32
+            and getattr(self.preprocess, "__func__", None)
+            is DINOv3Descriptor._stock_preprocess
+            and type(image) is np.ndarray
+            and resize == (512, 512)
+            and 1 <= image.shape[0] <= 65535
+            and 1 <= image.shape[1] <= 65535
+            and image.shape[0] * image.shape[1] <= 64_000_000
+            and device.type == "cuda"
+            and (backend != "triton" or sys.platform.startswith("linux"))
+            and not self.training
+            and not torch.is_grad_enabled()
+            and not torch.are_deterministic_algorithms_enabled()
+            and device.index == torch.cuda.current_device()
+        )
+        port = None
+        if supported:
+            if backend == "triton":
+                try:
+                    from .utils import rgb8_triton as port
+                except ModuleNotFoundError as error:
+                    if error.name != "triton":
+                        raise
+            else:
+                from .utils import rgb8_torch as port
+        if port is not None:
+            table = self._rgb8_codebook
+            if (
+                table is None
+                or table.device != device
+                or table.dtype != torch.float32
+                or tuple(table.shape) != (256,)
+                or not table.is_contiguous()
+            ):
+                table = torch.from_numpy(port.fp32_codebook()).to(device)
+                self._rgb8_codebook = table
+            options = {"compile_conversion": True} if backend == "torch-compile" else {}
+            prepared = port.prepare_rgb8(
+                image,
+                target_hw=(512, 512),
+                device=device,
+                codebook_device=table,
+                host_sampling=host_sampling,
+                **options,
+            )
+            return port.describe_prepared(self, prepared, keypoints=keypoints)
+        # CPU, gradients, other layouts/platforms/resizes or absent Triton retain
+        # the original normalization, interpolation and descriptor forward path.
+        tensor = self.rgb8_to_tensor(image)
+        data = {"image": tensor}
+        if keypoints is not None:
+            data["keypoints"] = keypoints
+        pred = self._forward(data, resize)
+        if keypoints is not None:
+            pred["keypoints"] = keypoints
+        return pred
 
     def sample_descriptors(
         self, features: torch.Tensor, keypoints: torch.Tensor, image_size: torch.Tensor
