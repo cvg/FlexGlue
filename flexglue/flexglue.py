@@ -37,8 +37,10 @@ class FlexGlue(nn.Module):
         "describe": True,  # build a DINOv3Descriptor for inputs without features
         "describe_resize": (512, 512),  # descriptor input, as refine_resize
         "refine": False,  # refine with RoMa v2's dense refiners
+        "refine_selected_features": False,  # opt in to skipping unused eval stages
         "refine_resize": (512, 512),  # refiner input, int: long side, (h, w): squash
         "refine_scales": (2, 1),  # RoMa refiner strides, coarse to fine
+        "refine_correlation": "torch",  # optional eager CUDA correlation: "triton"
         "coarse_stride": 8,  # coarse grid pitch, pixels of the resized image (8: cells)
         "max_num_samples": 5000,  # matches sampled from the grids without keypoints
         "kde_balance": True,  # RoMa v2's kde balancing of the sampled matches
@@ -50,6 +52,7 @@ class FlexGlue(nn.Module):
     fixed_conf = (
         "weights",
         "refine_scales",
+        "refine_correlation",
         "query_chunk_size",
         "input_dim",
         "descriptor_dim",
@@ -61,6 +64,8 @@ class FlexGlue(nn.Module):
     def __init__(self, **conf) -> None:
         super().__init__()
         self.conf = conf = SimpleNamespace(**{**self.default_conf, **conf})
+        if conf.refine_correlation not in ("torch", "triton"):
+            raise ValueError("refine_correlation must be 'torch' or 'triton'.")
         d, h = conf.descriptor_dim, conf.num_heads
         self.input_proj = nn.Linear(conf.input_dim, d)
         self.posenc = LearnableFourierPositionalEncoding(2, d // h)
@@ -81,7 +86,13 @@ class FlexGlue(nn.Module):
         self.descriptor = (
             DINOv3Descriptor(weights=conf.weights) if conf.describe else None
         )
-        self.refiner = RoMav2Refiner(conf.refine_scales) if conf.refine else None
+        self.refiner = (
+            RoMav2Refiner(
+                conf.refine_scales, correlation_backend=conf.refine_correlation
+            )
+            if conf.refine
+            else None
+        )
         self.static_lengths: Optional[Tuple[int, ...]] = None  # set by compile
 
     def compile(
@@ -345,9 +356,12 @@ class FlexGlue(nn.Module):
             for data in (data0, data1):
                 features = data.get("fine_features")
                 if features is None:
-                    features = self.refiner.extract(
-                        data["image"], resize=conf.refine_resize
+                    extract = (
+                        self.refiner.extract_selected
+                        if conf.refine_selected_features
+                        else self.refiner.extract
                     )
+                    features = extract(data["image"], resize=conf.refine_resize)
                 fine.append(features)
             context = context._replace(fine=tuple(fine))
         return context
