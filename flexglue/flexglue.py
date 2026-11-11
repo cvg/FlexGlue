@@ -35,6 +35,8 @@ class FlexGlue(nn.Module):
         "remove_border_px": 0.0,  # border margin, pixels of the descriptor input
         "mp": "float16",  # transformer dtype: float16, bfloat16 or None (fp32)
         "describe": True,  # build a DINOv3Descriptor for inputs without features
+        "describe_mp": None,  # optional resident fp16 descriptor network
+        "mmap_weights": False,  # opt in to immutable local CPU checkpoint backing
         "describe_resize": (512, 512),  # descriptor input, as refine_resize
         "refine": False,  # refine with RoMa v2's dense refiners
         "refine_resize": (512, 512),  # refiner input, int: long side, (h, w): squash
@@ -49,6 +51,8 @@ class FlexGlue(nn.Module):
     }
     fixed_conf = (
         "weights",
+        "describe_mp",
+        "mmap_weights",
         "refine_scales",
         "query_chunk_size",
         "input_dim",
@@ -61,6 +65,10 @@ class FlexGlue(nn.Module):
     def __init__(self, **conf) -> None:
         super().__init__()
         self.conf = conf = SimpleNamespace(**{**self.default_conf, **conf})
+        if conf.describe_mp not in (None, "float16"):
+            raise ValueError("describe_mp must be None or 'float16'.")
+        if not isinstance(conf.mmap_weights, bool):
+            raise ValueError("mmap_weights must be a bool.")
         d, h = conf.descriptor_dim, conf.num_heads
         self.input_proj = nn.Linear(conf.input_dim, d)
         self.posenc = LearnableFourierPositionalEncoding(2, d // h)
@@ -75,12 +83,41 @@ class FlexGlue(nn.Module):
             ]
         )
         self.loaded_heads = set(range(conf.n_layers + 1))
+        state_dict = (
+            ops._read_state_dict(conf.weights, allow_mmap=conf.mmap_weights)
+            if conf.weights is not None and conf.describe
+            else None
+        )
+        source_unique = (
+            (conf.mmap_weights and ops._unique_storage(state_dict.values()))
+            if state_dict is not None
+            else False
+        )
         if conf.weights is not None:
-            self.load_weights(conf.weights)
+            self.load_weights(
+                conf.weights,
+                state_dict=state_dict,
+                _assign_during_init=conf.mmap_weights,
+            )
+        if state_dict is not None:
+            # Retire matcher tensors after copying them into the model.
+            state_dict = {
+                k: v for k, v in state_dict.items() if k.startswith("extractor.")
+            }
         # the descriptor weights live in the same file, under "extractor."
         self.descriptor = (
-            DINOv3Descriptor(weights=conf.weights) if conf.describe else None
+            DINOv3Descriptor(
+                weights=conf.weights,
+                state_dict=state_dict,
+                mp=conf.describe_mp,
+                mmap_weights=conf.mmap_weights,
+                _assign_source_unique=source_unique,
+                _assign_owned_state=True,
+            )
+            if conf.describe
+            else None
         )
+        del state_dict
         self.refiner = RoMav2Refiner(conf.refine_scales) if conf.refine else None
         self.static_lengths: Optional[Tuple[int, ...]] = None  # set by compile
 
@@ -609,9 +646,18 @@ class FlexGlue(nn.Module):
             conf.filter_threshold,
         )
 
-    def load_weights(self, weights: str) -> None:
+    def load_weights(
+        self,
+        weights: str,
+        *,
+        state_dict: Optional[dict] = None,
+        _assign_during_init: bool = False,
+    ) -> None:
         """Strict for everything except whole per-layer heads, which may be absent."""
-        loaded = ops.load_state_dict(weights, "matcher.")
+        if state_dict is None:
+            state_dict = ops._read_state_dict(weights, allow_mmap=_assign_during_init)
+        source_unique = _assign_during_init and ops._unique_storage(state_dict.values())
+        loaded = ops.load_state_dict(weights, "matcher.", state_dict=state_dict)
         depth = len({k.split(".")[1] for k in loaded if k.startswith("transformers.")})
         if self.conf.n_layers > depth:
             raise ValueError(f"n_layers={self.conf.n_layers}, weights have {depth}.")
@@ -625,16 +671,47 @@ class FlexGlue(nn.Module):
             if parts[0] in ("transformers", "heads") and int(parts[1]) >= limit:
                 continue  # truncated model: layers past n_layers are not built
             state_dict[k] = v
-        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        # A reload owns only matcher parameters; descriptor/refiner state is separate.
+        expected = {
+            k: v
+            for k, v in self.state_dict().items()
+            if not k.startswith(("descriptor.", "refiner."))
+        }
+        missing = expected.keys() - state_dict.keys()
+        unexpected = state_dict.keys() - expected.keys()
         if unexpected:
-            raise KeyError(f"Unexpected weights: {unexpected}")
+            raise KeyError(f"Unexpected weights: {sorted(unexpected)}")
         if any(not k.startswith("heads.") for k in missing):
-            raise KeyError(f"Missing weights: {missing}")
+            raise KeyError(f"Missing weights: {sorted(missing)}")
         partial = {int(k.split(".")[1]) for k in missing}
         for layer in partial:
             prefix = f"heads.{layer}."
             if any(k.startswith(prefix) for k in state_dict):
                 raise KeyError(f"Head {layer} is only partially in the weights.")
+        for k, v in state_dict.items():
+            if not torch.overrides.is_tensor_like(v):
+                raise TypeError(f"Expected tensor-like weight for {k}.")
+            if isinstance(v, torch.Tensor) and (
+                v.is_meta or v.is_quantized or v.layout != torch.strided
+            ):
+                raise TypeError(
+                    f"Weight {k} must be a materialized, non-quantized strided tensor."
+                )
+            # PyTorch accepts a one-dimensional legacy value for a scalar.
+            legacy_scalar = expected[k].ndim == 0 and v.ndim == 1 and v.numel() > 0
+            if not legacy_scalar and v.shape != expected[k].shape:
+                raise RuntimeError(
+                    f"size mismatch for {k}: {tuple(v.shape)} != "
+                    f"{tuple(expected[k].shape)}"
+                )
+        ops.load_into_module(
+            self,
+            state_dict,
+            weights,
+            strict=False,
+            source_unique=source_unique,
+            allow_assign=_assign_during_init,
+        )
         self.loaded_heads = set(range(self.conf.n_layers + 1)) - partial
 
     def resolve_conf(self, conf: dict) -> SimpleNamespace:
