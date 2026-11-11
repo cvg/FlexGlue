@@ -113,6 +113,42 @@ def describe(session: ort.InferenceSession, image: np.ndarray) -> np.ndarray:
     return features
 
 
+def matcher_stride(metadata):
+    """Validate the stride-eight contract, including unannotated released graphs."""
+    stride = int(metadata.get("flexglue.stride", "8"))
+    if stride != 8:
+        raise ValueError("This matcher reader requires descriptor stride eight.")
+    return stride
+
+
+def matcher_input_feeds(session, feeds):
+    """Feed matcher geometry in descriptor pixels, preserving normalized points.
+
+    Both historical and current matcher graphs accept the same feature, point,
+    and image-size inputs. Transforming the points and their sizes together keeps
+    network coordinates unchanged while expressing distance checks in descriptor
+    pixels. Debug graphs that return image-space points must use original feeds.
+    """
+    names = {value.name for value in session.get_inputs()}
+    expected = set(feeds)
+    if names != expected:
+        raise ValueError(f"Unsupported matcher inputs: {sorted(names)}")
+    stride = matcher_stride(session.get_modelmeta().custom_metadata_map)
+    result = dict(feeds)
+    for i in (0, 1):
+        features = feeds[f"features{i}"]
+        h, w = features.shape[-2:]
+        size = np.array([[stride * w, stride * h]], dtype=np.float32)
+        original_size = np.asarray(feeds[f"image_size{i}"], dtype=np.float32)
+        if not np.isfinite(original_size).all() or (original_size <= 0).any():
+            raise ValueError("image sizes must be finite and positive")
+        result[f"kpts{i}"] = feeds[f"kpts{i}"] * (
+            size[:, None, :] / original_size[:, None, :]
+        )
+        result[f"image_size{i}"] = np.broadcast_to(size, original_size.shape).copy()
+    return result
+
+
 def match(
     session: ort.InferenceSession,
     features0: np.ndarray,
@@ -137,16 +173,15 @@ def match(
         image_size0, image_size1: (width, height) of the original images.
         filter_threshold: minimum match confidence.
         max_distance_px: maximum distance between a keypoint and the predicted
-            location of its match, in pixels of the 512 x 512 resized images:
-            in the original images, it is scaled by the long image side / 512,
-            averaged over both images. inf disables the check, while 0 rejects
+            location of its match, averaged over both descriptor input frames
+            (512 x 512 by default). inf disables the check, while 0 rejects
             all matches (unlike in PyTorch, where 0 disables it).
         min_covisibility: reject all matches if the covisibility score of the
             pair is lower than this value (0 disables the check).
         early_stop_decay: for matchers exported with --early_stop_layers,
             reject the pair after layer k without running the remaining layers
             if its covisibility score is below
-            min_covisibility * (1 - early_stop_decay) ** (9 - k).
+            min_covisibility * (1 - early_stop_decay) ** (n_layers - k).
 
     Returns:
         matches: (K, 2) indices into kpts0 and kpts1.
@@ -169,6 +204,7 @@ def match(
     }
     if "early_stop_decay" in [i.name for i in session.get_inputs()]:
         feeds["early_stop_decay"] = np.array(early_stop_decay, dtype=np.float32)
+    feeds = matcher_input_feeds(session, feeds)
     matches0, mscores0, covisibility_score = session.run(None, feeds)
     matches0, mscores0 = matches0[0], mscores0[0]
     valid = matches0 > -1

@@ -11,10 +11,9 @@ the assets, with SIFT keypoints, and compares:
 The options of the matcher (float16 transformer layers, fused operators of
 ONNX Runtime, early stopping) and the input resolution are read from the
 models. A matcher with early stopping is compared with early_stop_decay=1,
-which never stops early. If it checks the covisibility score after every layer
-but the first and the last, as FlexGlue does (export with --early_stop_layers
-2,...,8), it is also compared with early stopping, for early_stop_decay in
-EARLY_STOP_DECAYS. Otherwise, the outputs with early stopping are only printed.
+which never stops early. Enabled early stopping is also compared against
+FlexGlue using the same check layers read from the graph, for early_stop_decay
+in EARLY_STOP_DECAYS.
 
 Requires onnx, onnxscript and onnxruntime (onnxruntime-gpu on GPU).
 
@@ -25,7 +24,6 @@ Usage (from the root of the repository):
 """
 
 import argparse
-import re
 import sys
 import tempfile
 import time
@@ -40,7 +38,13 @@ import torch
 
 # Also run from a clone of the repository without installing it.
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from export import DEBUG_OUTPUTS, MATCHER_OUTPUTS, export_matcher  # noqa: E402
+from export import (  # noqa: E402
+    DEBUG_OUTPUTS,
+    MATCHER_OUTPUTS,
+    export_matcher,
+    read_early_stop_layers,
+)
+from match_pair import matcher_input_feeds, matcher_stride  # noqa: E402
 
 from flexglue import DINOv3Descriptor, FlexGlue  # noqa: E402
 from flexglue.flexglue import WEIGHTS_URL  # noqa: E402
@@ -94,8 +98,16 @@ def matcher_options(path: Path):
     """Options of an exported matcher, to export the equivalent debug graph."""
     model = onnx.load(str(path))
     graphs = list(subgraphs(model.graph))
+    metadata = {entry.key: entry.value for entry in model.metadata_props}
+    # Released graphs predate metadata and use nine layers with stride eight.
+    n_layers = int(metadata.get("flexglue.n_layers", "9"))
+    if n_layers < 0:
+        raise ValueError("Matcher layer count must be nonnegative.")
+    stride = matcher_stride(metadata)
+    early_stop = "early_stop_decay" in [i.name for i in model.graph.input]
     return SimpleNamespace(
-        size=input_size(model, "features0", stride=8),
+        n_layers=n_layers,
+        size=input_size(model, "features0", stride=stride),
         opset=next(o.version for o in model.opset_import if o.domain == ""),
         fp16=any(
             init.data_type == onnx.TensorProto.FLOAT16
@@ -107,13 +119,9 @@ def matcher_options(path: Path):
             for g in graphs
             for node in g.node
         ),
-        early_stop="early_stop_decay" in [i.name for i in model.graph.input],
-        # Layers after which the graph may stop early (see add_early_stopping).
-        early_stop_layers=sorted(
-            int(m.group(1))
-            for g in graphs
-            for node in g.node
-            if (m := re.fullmatch(r"early_stop_layer(\d+)_if", node.name))
+        early_stop=early_stop,
+        early_stop_layers=(
+            read_early_stop_layers(graphs, n_layers) if early_stop else []
         ),
     )
 
@@ -274,6 +282,8 @@ def compare_points(pred, debug, tol):
 
 def time_session(session, feeds, warmup: int = 2, runs: int = 10) -> float:
     """Average run time in milliseconds."""
+    if warmup < 0 or runs <= 0:
+        raise ValueError("warmup must be nonnegative and runs must be positive")
     for _ in range(warmup):
         session.run(None, feeds)
     t = time.time()
@@ -286,9 +296,10 @@ def check_matches(sessions, matcher, features, kpts, min_covisibility, tol, timi
     """Compare the matchers on one pair of images and keypoints."""
     pred = match_pytorch(matcher, *features, *kpts, min_covisibility)
     feeds = matcher_feeds(*features, *kpts, min_covisibility)
-    match_feeds = feeds
+    match_feeds = dict(feeds)
     if sessions.early_stop:  # early_stop_decay=1 never stops early
-        match_feeds = {**feeds, "early_stop_decay": np.array(1.0, np.float32)}
+        match_feeds["early_stop_decay"] = np.array(1.0, np.float32)
+    match_feeds = matcher_input_feeds(sessions.matcher, match_feeds)
     outputs = sessions.matcher.run(None, match_feeds)
     ok, message = compare_matches(pred, outputs, tol)
     if min_covisibility == 0:  # otherwise, the points may not be computed
@@ -306,13 +317,10 @@ def check_matches(sessions, matcher, features, kpts, min_covisibility, tol, timi
         f"{'OK' if ok else 'FAIL'}"
     )
     if sessions.early_stop and min_covisibility > 0:
-        if sessions.early_stop_comparable:
-            for decay in EARLY_STOP_DECAYS:
-                ok &= check_early_stop(
-                    sessions.matcher, matcher, features, kpts, feeds, decay, tol
-                )
-        else:
-            print_early_stop(sessions.matcher, feeds, early_stop_decay=0.5)
+        for decay in EARLY_STOP_DECAYS:
+            ok &= check_early_stop(
+                sessions.matcher, matcher, features, kpts, match_feeds, decay, tol
+            )
     return bool(ok)
 
 
@@ -328,17 +336,6 @@ def check_early_stop(session, matcher, features, kpts, feeds, decay, tol):
     ok, message = compare_matches(pred, outputs, tol)
     print(f"    early_stop_decay={decay}: {message} {'OK' if ok else 'FAIL'}")
     return ok
-
-
-def print_early_stop(session, feeds, early_stop_decay: float):
-    """Outputs with early stopping, not compared: the graph checks other layers
-    than FlexGlue, which checks every layer but the first and the last."""
-    feeds = {**feeds, "early_stop_decay": np.array(early_stop_decay, np.float32)}
-    matches0, _, covisibility_score = session.run(None, feeds)
-    print(
-        f"    early_stop_decay={early_stop_decay}: "
-        f"matches={(matches0[0] > -1).sum()} covis={covisibility_score[0]:.4f}"
-    )
 
 
 def check_pair(sessions, models, names, size, num_keypoints, tol, timing):
@@ -392,7 +389,6 @@ def main():
         matcher=None,
         debug=None,
         early_stop=False,
-        early_stop_comparable=False,
     )
     models = SimpleNamespace(descriptor=None, matcher=None)
     sizes, precision = set(), ""
@@ -409,14 +405,19 @@ def main():
             raise SystemExit("The float16 matcher requires CUDA.")
         sizes.add(options.size)
         precision = "_fp16" if options.fp16 else ""
-        models.matcher = FlexGlue(weights=args.weights, describe=False, mp=None)
+        if options.early_stop and not options.early_stop_layers:
+            raise SystemExit("Early-stop graph has no recognized check-layer schedule.")
+        models.matcher = FlexGlue(
+            weights=args.weights,
+            describe=False,
+            n_layers=options.n_layers,
+            mp=None,
+            early_stop_layers=options.early_stop_layers if options.early_stop else None,
+        )
         models.matcher.eval()
         sessions.matcher = ort.InferenceSession(str(args.matcher), providers=providers)
         sessions.debug = debug_session(models.matcher, options, providers)
         sessions.early_stop = options.early_stop
-        sessions.early_stop_comparable = options.early_stop_layers == list(
-            range(2, models.matcher.conf.n_layers)
-        )
         models.matcher = models.matcher.to(device)
     if len(sizes) > 1:
         raise SystemExit(f"The models have different input sizes: {sizes}")

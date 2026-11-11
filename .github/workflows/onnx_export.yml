@@ -11,12 +11,16 @@ on:
     paths:
       - "flexglue/**"
       - "onnx/**"
+      - "tests/test_early_stop*.py"
+      - "tests/test_onnx*.py"
       - "requirements.txt"
       - ".github/workflows/onnx_export.yml"
   pull_request:
     paths:
       - "flexglue/**"
       - "onnx/**"
+      - "tests/test_early_stop*.py"
+      - "tests/test_onnx*.py"
       - "requirements.txt"
       - ".github/workflows/onnx_export.yml"
 
@@ -26,7 +30,15 @@ concurrency:
 
 jobs:
   export-and-check:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        ort: ["1.30.0", "1.31.1"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -42,8 +54,13 @@ jobs:
           # CPU-only PyTorch; the export and its check depend on these versions.
           python -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install numpy opencv-python-headless \
-            onnx==1.23.2 onnxscript==0.7.2 onnxruntime==1.23.2
+            onnx==1.23.2 onnxscript==0.7.2 onnxruntime==${{ matrix.ort }}
           python -m pip install --no-deps -e .
+
+      - name: Check early-stop and input contracts
+        run: |
+          python -m unittest discover -s tests -p 'test_early_stop*.py' -v
+          python -m unittest discover -s tests -p 'test_onnx*.py' -v
 
       - name: Cache the weights
         uses: actions/cache@v4
@@ -52,29 +69,33 @@ jobs:
           key: flexglue-weights-v0.1
 
       - name: Export the descriptor and float32 matcher
-        run: python onnx/export.py --output_dir /tmp/flexglue_onnx
+        run: python onnx/export.py --output_dir "$RUNNER_TEMP/flexglue_onnx"
 
       - name: Check the descriptor and float32 matcher
         run: |
           python onnx/check.py --cpu \
-            --descriptor /tmp/flexglue_onnx/flexglue_descriptor.onnx \
-            --matcher /tmp/flexglue_onnx/flexglue_matcher.onnx
+            --descriptor "$RUNNER_TEMP/flexglue_onnx"/flexglue_descriptor.onnx \
+            --matcher "$RUNNER_TEMP/flexglue_onnx"/flexglue_matcher.onnx
 
-      # Check after every layer but the first and the last, as FlexGlue does,
-      # so that check.py also compares the outputs with early stopping.
+      # Compare the default native schedule and the released schedule.
       - name: Export the float32 matcher with early stopping
         run: |
           python onnx/export.py --matcher_only \
-            --early_stop_layers 2,3,4,5,6,7,8 --output_dir /tmp/flexglue_onnx
+            --early_stop_layers 2,3,4,5,6,7,8 --output_dir "$RUNNER_TEMP/flexglue_onnx"
 
       - name: Check the float32 matcher with early stopping
         run: |
           python onnx/check.py --cpu \
-            --matcher /tmp/flexglue_onnx/flexglue_matcher_early_stop.onnx
+            --matcher "$RUNNER_TEMP/flexglue_onnx"/flexglue_matcher_early_stop.onnx
 
       # The early-stopping configuration of the released models, which COLMAP
-      # uses (export only).
+      # uses.
       - name: Export the float32 matcher with early stopping after layers 2, 4, 6 and 8
         run: |
           python onnx/export.py --matcher_only --early_stop_layers 2,4,6,8 \
-            --output_dir /tmp/flexglue_onnx_released
+            --output_dir "$RUNNER_TEMP/flexglue_onnx_released"
+
+      - name: Check the released early-stopping schedule
+        run: |
+          python onnx/check.py --cpu --num_keypoints 1,512 \
+            --matcher "$RUNNER_TEMP/flexglue_onnx_released/flexglue_matcher_early_stop.onnx"

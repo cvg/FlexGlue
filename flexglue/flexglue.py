@@ -31,6 +31,7 @@ class FlexGlue(nn.Module):
         "filter_threshold": 0.1,  # min match confidence
         "max_distance_px": 3.0,  # max cycle error, pixels of the descriptor input
         "min_covisibility": 0.0,  # invalidate matches if covisibility_score is below
+        "early_stop_layers": None,  # None: intermediate layers >= 2; (): none
         "early_stop_decay": None,  # in [0, 1): decay per earlier layer (0: no decay)
         "remove_border_px": 0.0,  # border margin, pixels of the descriptor input
         "mp": "float16",  # transformer dtype: float16, bfloat16 or None (fp32)
@@ -61,6 +62,7 @@ class FlexGlue(nn.Module):
     def __init__(self, **conf) -> None:
         super().__init__()
         self.conf = conf = SimpleNamespace(**{**self.default_conf, **conf})
+        self.stopping_layers(conf)
         d, h = conf.descriptor_dim, conf.num_heads
         self.input_proj = nn.Linear(conf.input_dim, d)
         self.posenc = LearnableFourierPositionalEncoding(2, d // h)
@@ -330,9 +332,9 @@ class FlexGlue(nn.Module):
         with torch.autocast(f0.device.type, dtype, enabled=conf.mp is not None):
             for k, block in enumerate(self.transformers[: conf.n_layers], 1):
                 x0, x1 = block(x0, x1, enc0, enc1)
-                if conf.early_stop_decay is None or k in (1, conf.n_layers):
+                if conf.early_stop_decay is None or k not in conf.early_stop_layers:
                     continue
-                # stop after layer >= 2 on a confident non-pair batch (host sync)
+                # stop once the whole batch is a confident non-pair (host sync)
                 score = self.covisibility_score(x0, x1, k)
                 gamma = (1 - conf.early_stop_decay) ** (len(self.transformers) - k)
                 if (score < conf.min_covisibility * gamma).all():
@@ -637,6 +639,30 @@ class FlexGlue(nn.Module):
                 raise KeyError(f"Head {layer} is only partially in the weights.")
         self.loaded_heads = set(range(self.conf.n_layers + 1)) - partial
 
+    def require_heads(self, layers) -> None:
+        """Require checkpoint weights for every head a consumer will execute."""
+        for layer in layers:
+            if layer not in self.loaded_heads:
+                raise ValueError(f"No weights for the head of layer {layer}.")
+
+    def stopping_layers(self, conf) -> Tuple[int, ...]:
+        """Effective intermediate checks; the final layer always supplies a score."""
+        layers = conf.early_stop_layers
+        if layers is None:
+            return tuple(range(2, conf.n_layers))
+        if not isinstance(layers, (tuple, list)) or any(
+            not isinstance(k, int)
+            or isinstance(k, bool)
+            or not 0 < k < self.conf.n_layers
+            for k in layers
+        ):
+            raise ValueError(
+                "early_stop_layers must contain intermediate integer layers."
+            )
+        if len(set(layers)) != len(layers):
+            raise ValueError("early_stop_layers must not contain duplicates.")
+        return tuple(k for k in sorted(layers) if k < conf.n_layers)
+
     def resolve_conf(self, conf: dict) -> SimpleNamespace:
         """Merge per-call overrides with the construction conf."""
         if unknown := conf.keys() - self.default_conf.keys():
@@ -646,8 +672,7 @@ class FlexGlue(nn.Module):
         c = SimpleNamespace(**{**vars(self.conf), **conf})
         if not 0 <= c.n_layers <= self.conf.n_layers:
             raise ValueError(f"n_layers must be in [0, {self.conf.n_layers}].")
-        if c.n_layers not in self.loaded_heads:
-            raise ValueError(f"No weights for the head of layer {c.n_layers}.")
+        self.require_heads((c.n_layers,))
         if c.describe and self.descriptor is None:
             raise ValueError("describe=True needs FlexGlue(describe=True) at init.")
         if c.refine and self.refiner is None:
@@ -656,6 +681,7 @@ class FlexGlue(nn.Module):
             raise ValueError(f"mp must be 'float16', 'bfloat16' or None: {c.mp!r}")
         if not isinstance(c.coarse_stride, int) or c.coarse_stride <= 0:
             raise ValueError(f"coarse_stride must be a positive int: {c.coarse_stride}")
+        c.early_stop_layers = self.stopping_layers(c)
         if c.early_stop_decay is not None:
             if not 0 <= c.early_stop_decay < 1:
                 raise ValueError(
@@ -663,8 +689,5 @@ class FlexGlue(nn.Module):
                 )
             if c.min_covisibility <= 0:
                 raise ValueError("early_stop_decay needs min_covisibility > 0.")
-            if missing := set(range(1, c.n_layers + 1)) - self.loaded_heads:
-                raise ValueError(
-                    f"early_stop_decay needs all heads, missing {sorted(missing)}."
-                )
+            self.require_heads(c.early_stop_layers)
         return c
