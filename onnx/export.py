@@ -219,7 +219,9 @@ class SparseMatcherONNX(nn.Module):
         super().__init__()
         self.matcher = matcher
         self.n_layers = matcher.conf.n_layers
-        self.conf = matcher.resolve_conf({"mp": None, "exact_nn": True})
+        self.conf = matcher.resolve_conf(
+            {"mp": None, "exact_nn": True, "refine": False}
+        )
         self.debug_outputs = debug_outputs
         # Cast the transformer layers to float16, including their residual
         # stream and LayerNorms, unlike the autocast of FlexGlue(mp="float16")
