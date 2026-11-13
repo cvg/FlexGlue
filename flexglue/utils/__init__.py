@@ -5,5 +5,6 @@ from .preprocess import (  # noqa
     numpy_image_to_torch,
     rbd,
     read_image,
+    read_images,
     resize_image,
 )

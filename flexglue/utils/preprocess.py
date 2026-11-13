@@ -1,4 +1,5 @@
 import collections.abc as collections
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -157,3 +158,29 @@ def load_image(path: Path, resize: int = None, **kwargs) -> torch.Tensor:
     if resize is not None:
         image, _ = resize_image(image, resize, **kwargs)
     return numpy_image_to_torch(image)
+
+
+@contextmanager
+def read_images(paths, grayscale=False, *, prefetch=False):
+    """Yield an iterator of ``(path, image)`` pairs in input order.
+
+    Images have exactly the same RGB/grayscale pixels and layout as
+    :func:`read_image`. With ``prefetch=True``, two CPU workers read ahead,
+    with at most two pending reads. Retaining the previous image while advancing
+    can transiently keep four decoded images alive; release it before advancing
+    to avoid that extra handoff image. The iterator does not retain yielded
+    pixels once the consumer drops them.
+    Conversion, GPU transfers and model calls belong in the consuming thread.
+
+    Always use ``with read_images(...) as images``: leaving the context cancels
+    queued reads and joins running workers, including after an early break or
+    exception. Errors surface at the corresponding input ordinal; up to two
+    successor reads may already have started. Files must remain unchanged
+    during consumption. There is no persistent cache.
+    """
+    from ._ordered_decode import ordered_decode
+
+    with ordered_decode(
+        paths, lambda path: read_image(path, grayscale=grayscale), enabled=prefetch
+    ) as images:
+        yield images
