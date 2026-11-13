@@ -21,7 +21,7 @@ def apply_rotary(enc: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Attention on token-major (B, N, H, D) tensors, returns (B, N, H * D).
 
-    A module-level function, so that exporters can swap in a fused operator.
+    Exporters can supply an alternate callable on individual blocks.
     """
     out = F.scaled_dot_product_attention(  # flash
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
@@ -70,6 +70,7 @@ class SelfBlock(nn.Module):
         self.ffn = ffn(dim)
         # rows of Wqkv ordered as (H, D, 3) (checkpoint) or (3, H, D) (blocked)
         self.blocked_qkv = False
+        self.attention = None  # optional per-block export implementation
 
     def use_blocked_qkv(self) -> None:
         """Reorder the rows of Wqkv from (H, D, 3) to (3, H, D), same outputs.
@@ -97,7 +98,8 @@ class SelfBlock(nn.Module):
         q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
         encoding = encoding.transpose(-3, -2)  # broadcast over (N, H) instead of (H, N)
         q, k = apply_rotary(encoding, q), apply_rotary(encoding, k)
-        message = self.out_proj(attention(q, k, v.contiguous()))
+        attend = attention if self.attention is None else self.attention
+        message = self.out_proj(attend(q, k, v.contiguous()))
         return x + self.ffn(torch.cat([x, self.message_norm(message)], -1))
 
 
@@ -111,6 +113,7 @@ class CrossBlock(nn.Module):
         self.qk_norm = nn.LayerNorm(dim // num_heads)
         self.message_norm = nn.LayerNorm(dim)
         self.ffn = ffn(dim)
+        self.attention = None  # optional per-block export implementation
 
     def forward(
         self, x0: torch.Tensor, x1: torch.Tensor
@@ -120,8 +123,9 @@ class CrossBlock(nn.Module):
             for t in (self.to_qk(x0), self.to_qk(x1), self.to_v(x0), self.to_v(x1))
         )
         qk0, qk1 = self.qk_norm(qk0).to(v0.dtype), self.qk_norm(qk1).to(v1.dtype)
-        m0 = self.to_out(attention(qk0, qk1, v1))
-        m1 = self.to_out(attention(qk1, qk0, v0))
+        attend = attention if self.attention is None else self.attention
+        m0 = self.to_out(attend(qk0, qk1, v1))
+        m1 = self.to_out(attend(qk1, qk0, v0))
         x0 = x0 + self.ffn(torch.cat([x0, self.message_norm(m0)], -1))
         x1 = x1 + self.ffn(torch.cat([x1, self.message_norm(m1)], -1))
         return x0, x1

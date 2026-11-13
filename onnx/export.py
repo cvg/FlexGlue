@@ -86,7 +86,6 @@ from torch import nn
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from flexglue import DINOv3Descriptor, FlexGlue  # noqa: E402
 from flexglue.flexglue import WEIGHTS_URL  # noqa: E402
-from flexglue.utils import modules  # noqa: E402
 
 # Minimal schema of ONNX Runtime's contrib MultiHeadAttention operator (only
 # the query/key/value inputs and the output), so that the exporter can emit it.
@@ -186,13 +185,20 @@ def exportable(matcher: FlexGlue, fused: bool = True):
                 gelus = [i for i, m in enumerate(ffn) if isinstance(m, nn.GELU)]
                 for i in gelus:
                     ffn[i] = FusedGELU()
-    original = modules.attention
-    if fused:
-        modules.attention = fused_attention
+    blocks = [
+        block
+        for layer in matcher.transformers
+        for block in (layer.self_attn, layer.cross_attn)
+    ]
+    original = [block.attention for block in blocks]
     try:
+        if fused:
+            for block in blocks:
+                block.attention = fused_attention
         yield
     finally:
-        modules.attention = original
+        for block, previous in zip(blocks, original):
+            block.attention = previous
 
 
 class DescriptorONNX(nn.Module):
