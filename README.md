@@ -267,6 +267,8 @@ Batching has a few requirements:
 `DINOv3Descriptor`:
 - ```resize```: Backbone input size: an int sets the long side (aspect kept, sides floored to multiples of 32), ```(h, w)``` squashes. Default: (512, 512).
 - ```describe```: Also return descriptors at the given keypoints. Default: True.
+- ```mp```: Keep the descriptor backbone and feature head in resident `"float16"` weights; `None` retains float32. Default: `None`.
+- ```mmap_weights```: Opt in to mapped loading of a compatible local checkpoint. Keep that file immutable while CPU model weights use it; other configurations use ordinary loading. Checkpoint read errors still propagate. Default: False.
 - ```weights```: Path or URL of the weights. Default: the release weights.
 
 `FlexGlue`:
@@ -277,6 +279,8 @@ Batching has a few requirements:
 - ```early_stop_decay```: Stop after layer ```k``` if ```covisibility_score < min_covisibility * (1 - early_stop_decay) ** (9 - k)```, lower stops earlier. Default: None (off). Never stop after first layer.
 - ```remove_border_px```: Drop matches this close to the border, in pixels of the resized image (as ```max_distance_px```). Default: 0.0.
 - ```mp```: Transformer mixed precision: ```"float16"```, ```"bfloat16"``` or ```None``` (float32). Default: ```"float16"```.
+- ```describe_mp```: Optional resident `"float16"` descriptor backbone and feature head; `None` keeps the float32 descriptor. Default: `None`.
+- ```mmap_weights```: Opt in to mapped loading of a compatible local checkpoint. Keep that file immutable while CPU model weights use it; other configurations use ordinary loading. Checkpoint read errors still propagate. Default: False.
 - ```describe_resize```: Input size of the built-in descriptor, as ```resize``` above. Default: (512, 512).
 - ```gemm_nn```: Sparse mode: mutual nearest neighbors in one matrix multiplication, faster for many keypoints. Default: True.
 - ```exact_nn```: With ```gemm_nn```, compute the squared distances from coordinate differences instead of one matrix multiplication: slower but exact, also where float32 matrix multiplications run in TF32. Default: False.
@@ -376,3 +380,7 @@ If you use any ideas from the paper or code from this repo, please consider citi
   year      = {2026}
 }
 ```
+
+URL checkpoints use restricted deserialization too. The hub loader must accept
+`weights_only=True`; an older helper refuses that URL call rather than retrying
+unrestricted loading. An already downloaded local checkpoint remains supported.
