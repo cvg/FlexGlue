@@ -36,6 +36,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         ort: ["1.30.0", "1.31.1"]
     runs-on: ${{ matrix.os }}
+    env:
+      ORT_DISABLE_TELEMETRY: "1"
     defaults:
       run:
         shell: bash
