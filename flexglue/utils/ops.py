@@ -212,9 +212,9 @@ def kde_weights(
     for i, grid in enumerate((dense_p2d0_n1, dense_p2d1_n0)):
         pair = [grid_sources(grid).flatten(1, 2), grid.flatten(1, 2)]
         points.append(torch.cat([pair[i], pair[1 - i]], -1))  # (x0, x1) normalized
-    density = (
-        lattice_kde(torch.cat(points, 1), valid, std) * scale[:, None]
-    )  # unweighted
+    points = torch.cat(points, 1)
+    points = points.masked_fill((valid[..., None] == 0) & points.isnan(), 0)
+    density = lattice_kde(points, valid, std) * scale[:, None]  # unweighted
     balance = torch.where(density < min_support, 1e-7, 1 / (density + 1))
     return balance * valid  # valid cells only, no extra confidence weighting
 
