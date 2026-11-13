@@ -217,6 +217,10 @@ Dense matches, from `match_dense` and the sampled mode, per direction `i -> j`. 
 
 </details>
 
+### Reproducing sampled matches
+
+Seed PyTorch for sampling, but do not treat a seed as a bitwise replay guarantee on CUDA: KDE balancing uses `scatter_add_`, which [PyTorch documents as potentially nondeterministic](https://docs.pytorch.org/docs/stable/generated/torch.Tensor.scatter_add_.html). `kde_balance=False` selects a different sampling distribution; it is not a reproducibility setting.
+
 ## Look-alike pairs and early stopping
 
 `pred["covisibility_score"]` is the probability that the two images show the same place. With `min_covisibility > 0`, all matches of a pair below this score are rejected.
