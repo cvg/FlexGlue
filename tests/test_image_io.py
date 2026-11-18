@@ -270,7 +270,9 @@ class Reader(unittest.TestCase):
                     with scope["read_images"](
                         paths, grayscale=grayscale, prefetch=True
                     ) as rows:
-                        for i, (p, actual) in enumerate(rows):
+                        actual_rows = list(rows)
+                        self.assertEqual(len(actual_rows), len(paths))
+                        for i, (p, actual) in enumerate(actual_rows):
                             ref = expected[i]
                             self.assertEqual(p, paths[i])
                             self.assertEqual(
@@ -320,7 +322,9 @@ class PublicReaderIntegration(unittest.TestCase):
                 with self.read_images(
                     iter(paths), grayscale=grayscale, prefetch=True
                 ) as rows:
-                    for index, (path, actual) in enumerate(rows):
+                    actual_rows = list(rows)
+                    self.assertEqual(len(actual_rows), len(paths))
+                    for index, (path, actual) in enumerate(actual_rows):
                         self.assertEqual(path, paths[index])
                         reference = expected[index]
                         self.assertEqual(actual.shape, reference.shape)
