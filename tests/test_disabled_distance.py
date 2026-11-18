@@ -35,6 +35,9 @@ class DisabledDistanceTest(unittest.TestCase):
                 expected = self.model.match_dense(
                     *self.data, symmetric=symmetric, max_distance_px=None
                 )
+                self.assertEqual(expected["dense_p2d0_i1"].shape, (2, 2, 3, 2))
+                if symmetric:
+                    self.assertEqual(expected["dense_p2d1_i0"].shape, (2, 2, 3, 2))
                 for distance in (0, -1, -10.0):
                     actual = self.model.match_dense(
                         *self.data, symmetric=symmetric, max_distance_px=distance
@@ -76,7 +79,14 @@ class DisabledDistanceTest(unittest.TestCase):
 
     def test_cycle_gate_retains_or_filters_known_cells(self):
         size = torch.tensor([[24.0, 16.0]])
-        data = [{"image_size": size, "resized_size": size} for _ in range(2)]
+        data = [
+            {
+                "features": torch.zeros(1, 4, 2, 3),
+                "image_size": size,
+                "resized_size": size,
+            }
+            for _ in range(2)
+        ]
         grid = ops.grid_sources(torch.zeros(1, 1, 3, 2))
         context = SimpleNamespace(covisibility_score=torch.ones(1))
         for distance in (None, 0, -1, -10.0, 3.0):
