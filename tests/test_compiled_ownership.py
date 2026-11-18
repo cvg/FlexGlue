@@ -124,6 +124,7 @@ class CompiledOwnershipTest(unittest.TestCase):
             expected = TransformerLayer.forward(copied.transformers[0], *args)
             self.assertFalse(torch.equal(before[0], expected[0]))
             actual = copied.transformers[0](*args)
+            self.assertEqual(len(actual), 2)
             for a, e in zip(actual, expected):
                 torch.testing.assert_close(a, e, rtol=0, atol=0)
 
@@ -135,6 +136,7 @@ class CompiledOwnershipTest(unittest.TestCase):
         with torch.no_grad():
             expected = TransformerLayer.forward(copied.transformers[0], *args)
             actual = copied.transformers[0](*args)
+        self.assertEqual(len(actual), 2)
         for a, e in zip(actual, expected):
             self.assertEqual(a.dtype, torch.float64)
             torch.testing.assert_close(a, e, rtol=0, atol=0)
@@ -164,6 +166,7 @@ class CompiledOwnershipTest(unittest.TestCase):
             copied.refiner.refiners["1"].warp_head.bias[0].add_(4)
             expected = RoMav2Refiner.forward(copied.refiner, fine, fine, warp, logits)
             actual = copied.refiner(fine, fine, warp, logits)
+            self.assertEqual(len(actual), 2)
             for a, e in zip(actual, expected):
                 torch.testing.assert_close(a, e, rtol=0, atol=0)
 
