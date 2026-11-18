@@ -74,6 +74,8 @@ class SamplingValidityTest(unittest.TestCase):
             if key.startswith("dense_p2d"):
                 value.fill_(float("nan"))
         result = self.sample(pred)
+        self.assertEqual(result["matches0"].shape, (1, 8))
+        self.assertEqual(result["matching_scores0"].shape, (1, 8))
         self.assertTrue((result["matches0"] == -1).all())
         self.assertTrue((result["matching_scores0"] == 0).all())
 
