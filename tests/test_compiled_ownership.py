@@ -85,7 +85,7 @@ class CompiledOwnershipTest(unittest.TestCase):
     def test_copied_descriptor_uses_copy_parameters_and_dtype(self):
         descriptor = DINOv3Descriptor.__new__(DINOv3Descriptor)
         torch.nn.Module.__init__(descriptor)
-        descriptor.conf = SimpleNamespace(resize=(32, 32), describe=False, mp=None)
+        descriptor.conf = SimpleNamespace(resize=(32, 32), describe=False)
         descriptor.backbone = torch.nn.Conv2d(3, 3, 1)
         descriptor.head = torch.nn.Identity()
         descriptor.register_buffer("mean", torch.zeros(3, 1, 1))

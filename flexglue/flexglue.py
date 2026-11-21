@@ -393,7 +393,7 @@ class FlexGlue(nn.Module):
         ):
             return head(points_ni, cf_i, cf_j)
         length = next(s for s in self.static_lengths if s >= n)
-        # Preserve the contiguous compiled input contract for strided views.
+        # Preserve the previous copy/layout behavior for strided views.
         if n != length or not points_ni.is_contiguous():
             points_ni = F.pad(points_ni, (0, 0, 0, length - n))
         p2di_nj, confidence = head.compiled_forward(points_ni, cf_i, cf_j)
