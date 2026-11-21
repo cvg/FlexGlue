@@ -140,10 +140,13 @@ class CompiledAllocationTest(unittest.TestCase):
 
     def test_pair_context_conversion_gradients_and_ownership(self):
         for dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
-            for compiled in (False, True):
+            for static_lengths in (None, (), (4,)):
+                compiled = static_lengths is not None
                 for strided in (False, True):
-                    with self.subTest(dtype=dtype, compiled=compiled, strided=strided):
-                        self.model.static_lengths = (4,) if compiled else None
+                    with self.subTest(
+                        dtype=dtype, static_lengths=static_lengths, strided=strided
+                    ):
+                        self.model.static_lengths = static_lengths
                         width = 16 if strided else 8
                         originals = [
                             torch.randn(1, 6, width, dtype=dtype) for _ in range(2)
