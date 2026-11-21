@@ -201,21 +201,34 @@ def lattice_kde(
     point_idx = (base * strides).sum(-1)
     corner_idx = (corners * strides).sum(-1)
     idx = (point_idx[..., None] + corner_idx).flatten(1)  # (B, N * 2^d)
-    tent = torch.where(corners.bool(), frac[:, :, None], 1 - frac[:, :, None]).prod(-1)
-    lattice = u.new_zeros(b, size**d)
+    # Retire address construction before the large corner-weight product.
+    del u, base, point_idx, corner_idx, strides
+    f, *rest = frac.unbind(-1)
+    tent = torch.stack((1 - f, f), -1)
+    for f in rest:
+        tent = (tent[..., None] * torch.stack((1 - f, f), -1)[:, :, None]).flatten(-2)
+    del f, rest, frac, corners
+    lattice = tent.new_zeros(b, size**d)
     lattice.scatter_add_(1, idx, (tent * weights[..., None].float()).flatten(1))
-    # Coordinate construction buffers are no longer needed during the blur.
-    del u, base, frac, point_idx, corner_idx, corners, strides
     # splat and read tents add pitch^2 / 6 each
     k = torch.arange(-r, r + 1, device=points.device, dtype=lattice.dtype) * pitch
     kernel = (std / s * torch.exp(-(k**2) / (2 * s**2))).view(1, 1, -1)
+    # Treat independent lines as depthwise channels.
+    channels = size if d > 1 else 1
+    kernel = kernel.expand(channels, 1, -1)
     lattice = lattice.view(b, *[size] * d)
     for dim in range(1, d + 1):
         x = lattice.movedim(dim, -1)
-        x = F.conv1d(x.reshape(-1, 1, size), kernel, padding=r).view(x.shape)
+        shape = x.shape
+        x = x.reshape(-1, channels, size).contiguous()
+        # Retire the old layout before the convolution allocates its workspace.
+        del lattice
+        x = F.conv1d(x, kernel, padding=r, groups=channels).view(shape)
         lattice = x.movedim(-1, dim)
     lattice = lattice.reshape(b, -1)
-    return (lattice.gather(1, idx).view_as(tent) * tent).sum(-1)
+    values = lattice.gather(1, idx).view_as(tent)
+    del lattice, x, idx
+    return (values * tent).sum(-1)
 
 
 def kde_weights(
@@ -229,8 +242,9 @@ def kde_weights(
 ) -> torch.Tensor:
     """RoMa v2's balanced sampling weights (B, N) of the valid (score > 0) cells."""
     valid = (scores > 0).float()
-    pool = valid.sum(1).clamp(max=expansion * num_samples)
-    scale = pool / valid.sum(1).clamp_min(1)  # density in samples of RoMa's pool
+    count = valid.sum(1)
+    pool = count.clamp(max=expansion * num_samples)
+    scale = pool / count.clamp_min(1)  # density in samples of RoMa's pool
     min_support = (min_density * pool)[:, None]  # RoMa: 10 of a 4 x 5000 pool
     points = []
     for i, grid in enumerate((dense_p2d0_n1, dense_p2d1_n0)):
