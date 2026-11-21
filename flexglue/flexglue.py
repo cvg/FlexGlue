@@ -530,10 +530,11 @@ class FlexGlue(nn.Module):
     def sparse_matches(self, pred: dict, data0: dict, data1: dict, conf) -> dict:
         """Mutual nearest neighbours of keypoints and predicted points."""
         size0, size1 = self.descriptor_size(data0), self.descriptor_size(data1)
-        kpts0 = self.to_resized(data0["keypoints"], data0, size0)
-        kpts1 = self.to_resized(data1["keypoints"], data1, size1)
-        p2d0_i1 = self.to_resized(pred["p2d0_i1"], data1, size1)
-        p2d1_i0 = self.to_resized(pred["p2d1_i0"], data0, size0)
+        # Geometry controls discrete selection; confidence keeps its gradients.
+        kpts0 = self.to_resized(data0["keypoints"], data0, size0).detach()
+        kpts1 = self.to_resized(data1["keypoints"], data1, size1).detach()
+        p2d0_i1 = self.to_resized(pred["p2d0_i1"], data1, size1).detach()
+        p2d1_i0 = self.to_resized(pred["p2d1_i0"], data0, size0).detach()
         if conf.gemm_nn:  # centered on each image for float32 precision
             c0, c1 = size0[:, None] / 2, size1[:, None] / 2
             x = torch.cat([p2d0_i1 - c1, kpts0 - c0], -1)
@@ -543,40 +544,38 @@ class FlexGlue(nn.Module):
         else:
             dist = 0.5 * (torch.cdist(p2d0_i1, kpts1) + torch.cdist(kpts0, p2d1_i0))
         # Rejected nonfinite predictions must not steal finite mutual neighbors.
-        # Selection and threshold checks are discrete; no distance gradients escape.
-        dist = dist.detach()
         dist.nan_to_num_(nan=torch.inf, posinf=torch.inf, neginf=torch.inf)
-        nearest = ops.mutual_nn(dist, return_distances=not conf.gemm_nn)
+        check_distance = ops.is_set(conf.max_distance_px)
+        nearest = ops.mutual_nn(
+            dist, return_distances=check_distance and not conf.gemm_nn
+        )
         m0, m1 = nearest[:2]
         del dist  # Neither branch needs the full distance matrix again.
+        idx0, idx1 = m0.clamp(0), m1.clamp(0)
 
-        if conf.gemm_nn:
+        if check_distance and conf.gemm_nn:
             # exact mean distance of the selected pairs only
             def take(t: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-                return t.gather(1, m.clamp(0)[..., None].expand(-1, -1, 2))
+                return t.gather(1, m[..., None].expand(-1, -1, 2))
 
             dist0 = 0.5 * (
-                (p2d0_i1 - take(kpts1, m0)).norm(dim=-1)
-                + (kpts0 - take(p2d1_i0, m0)).norm(dim=-1)
+                (p2d0_i1 - take(kpts1, idx0)).norm(dim=-1)
+                + (kpts0 - take(p2d1_i0, idx0)).norm(dim=-1)
             )
             dist1 = 0.5 * (
-                (take(p2d0_i1, m1) - kpts1).norm(dim=-1)
-                + (take(kpts0, m1) - p2d1_i0).norm(dim=-1)
+                (take(p2d0_i1, idx1) - kpts1).norm(dim=-1)
+                + (take(kpts0, idx1) - p2d1_i0).norm(dim=-1)
             )
-        else:
+        elif check_distance:
             dist0, dist1 = nearest[2:]
         # geometric mean of both confidences, as the cycle score
-        scores0 = (
-            pred["confidence0"] * pred["confidence1"].gather(1, m0.clamp(0))
-        ).sqrt()
-        scores1 = (
-            pred["confidence1"] * pred["confidence0"].gather(1, m1.clamp(0))
-        ).sqrt()
+        scores0 = (pred["confidence0"] * pred["confidence1"].gather(1, idx0)).sqrt()
+        scores1 = (pred["confidence1"] * pred["confidence0"].gather(1, idx1)).sqrt()
         valid0 = (m0 > -1) & (scores0 >= conf.filter_threshold)
         valid1 = (m1 > -1) & (scores1 >= conf.filter_threshold)
-        valid0 &= pred["valid0"] & pred["valid1"].gather(1, m0.clamp(0))
-        valid1 &= pred["valid1"] & pred["valid0"].gather(1, m1.clamp(0))
-        if ops.is_set(conf.max_distance_px):  # dist and scale average both images
+        valid0 &= pred["valid0"] & pred["valid1"].gather(1, idx0)
+        valid1 &= pred["valid1"] & pred["valid0"].gather(1, idx1)
+        if check_distance:  # dist and scale average both images
             valid0 &= dist0 < conf.max_distance_px
             valid1 &= dist1 < conf.max_distance_px
         return {

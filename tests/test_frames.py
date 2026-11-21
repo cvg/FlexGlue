@@ -146,15 +146,23 @@ class DescriptorFrameTest(unittest.TestCase):
             "valid0": torch.ones(1, 1, dtype=torch.bool),
             "valid1": torch.ones(1, 1, dtype=torch.bool),
         }
-        for gemm in (False, True):
+        for gemm, exact in ((True, False), (True, True), (False, False)):
             for threshold, expected in (
+                (None, 0),
+                (0.0, 0),
+                (-1.0, 0),
+                (float("nan"), 0),
                 (1.0, -1),
                 (1.1, 0),
+                (torch.tensor(0.0), -1),
+                (torch.tensor(-1.0), -1),
+                (torch.tensor(float("nan")), -1),
+                (torch.tensor(float("inf")), 0),
             ):
-                with self.subTest(gemm=gemm, threshold=threshold):
+                with self.subTest(gemm=gemm, exact=exact, threshold=threshold):
                     conf = SimpleNamespace(
                         gemm_nn=gemm,
-                        exact_nn=False,
+                        exact_nn=exact,
                         filter_threshold=0.0,
                         max_distance_px=threshold,
                     )
@@ -163,6 +171,10 @@ class DescriptorFrameTest(unittest.TestCase):
                     )
                     self.assertEqual(result["matches0"].item(), expected)
                     self.assertEqual(result["matches1"].item(), expected)
+                    for i in (0, 1):
+                        self.assertEqual(
+                            result[f"matching_scores{i}"].item(), float(expected >= 0)
+                        )
 
     def test_square_frames_with_unequal_image_scales(self):
         data0 = {
