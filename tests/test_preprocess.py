@@ -149,37 +149,51 @@ class ImageConversionTest(unittest.TestCase):
 
 
 class ResizeImagesTest(unittest.TestCase):
-    def test_singleton_matches_cat_values_gradients_and_storage(self):
-        for batch in (1, 2):
-            for target in ((4, 6), (3, 5)):
-                with self.subTest(batch=batch, target=target):
-                    base = torch.arange(batch * 3 * 4 * 6, dtype=torch.float32)
-                    source = base.reshape(batch, 3, 4, 6).requires_grad_()
-                    expected = torch.cat(
-                        [
-                            torch.nn.functional.interpolate(
-                                source, target, mode="bilinear", align_corners=False
-                            )
-                        ]
-                    )
-                    with mock.patch("torch.cat", wraps=torch.cat) as cat:
-                        actual = resize_images(source, target)
-                    cat.assert_not_called()
-                    self.assertTrue(torch.equal(actual, expected))
-                    self.assertEqual(actual.shape, expected.shape)
-                    self.assertNotEqual(
-                        actual.untyped_storage().data_ptr(),
-                        source.untyped_storage().data_ptr(),
-                    )
-                    weights = torch.arange(actual.numel()).reshape(actual.shape)
-                    ga = torch.autograd.grad(
-                        (actual * weights).sum(), source, retain_graph=True
-                    )[0]
-                    ge = torch.autograd.grad((expected * weights).sum(), source)[0]
-                    self.assertTrue(torch.equal(ga, ge))
-                    before = source.detach().clone()
-                    actual.detach().fill_(0)
-                    self.assertTrue(torch.equal(source.detach(), before))
+    def test_owned_result_and_gradients(self):
+        # Equal-size interpolation must still own its result, as must resized
+        # CHW, grayscale, strided and batched input, including singleton lists.
+        source = torch.linspace(-1, 1, 2 * 3 * 5 * 7).reshape(2, 3, 5, 7)
+        for image in (
+            source,
+            source[:1],
+            source[0],
+            source[0, :1],
+            source.transpose(-1, -2),
+            source.contiguous(memory_format=torch.channels_last),
+        ):
+            for resize in (image.shape[-2:], (3, 4)):
+                for as_list in (False, True):
+                    with self.subTest(
+                        shape=image.shape, resize=resize, as_list=as_list
+                    ):
+                        x = image.detach().clone().requires_grad_()
+                        before = x.detach().clone()
+                        batch = x[None] if x.ndim == 3 else x
+                        expected = torch.nn.functional.interpolate(
+                            batch.expand(-1, 3, -1, -1),
+                            resize,
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        actual = resize_images([x] if as_list else x, resize)
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                        grad = torch.autograd.grad(
+                            actual.square().sum(), x, create_graph=True
+                        )[0]
+                        reference_grad = torch.autograd.grad(
+                            expected.square().sum(), x, create_graph=True
+                        )[0]
+                        torch.testing.assert_close(grad, reference_grad, rtol=0, atol=0)
+                        second = torch.autograd.grad(grad.square().sum(), x)[0]
+                        reference_second = torch.autograd.grad(
+                            reference_grad.square().sum(), x
+                        )[0]
+                        torch.testing.assert_close(
+                            second, reference_second, rtol=0, atol=0
+                        )
+                        with torch.no_grad():
+                            actual.add_(1)
+                        torch.testing.assert_close(x, before, rtol=0, atol=0)
 
     def test_list_batching_and_empty_behavior(self):
         images = [torch.ones(3, 4, 6), torch.full((3, 4, 6), 2.0)]
