@@ -88,6 +88,9 @@ class DisabledDistanceTest(unittest.TestCase):
             for _ in range(2)
         ]
         grid = ops.grid_sources(torch.zeros(1, 1, 3, 2))
+        warps = [grid.clone(), grid.clone()]
+        # Both round trips have errors of 0, 2 and 4 pixels.
+        warps[0][..., 0] -= torch.tensor([0.0, 1 / 6, 1 / 3])
         context = SimpleNamespace(covisibility_score=torch.ones(1))
         for distance in (None, 0, -1, -10.0, 3.0):
             with self.subTest(distance=distance):
@@ -99,20 +102,13 @@ class DisabledDistanceTest(unittest.TestCase):
                 )
                 pred = {}
                 for i, j in ((0, 1), (1, 0)):
-                    pred[f"dense_p2d{i}_n{j}"] = grid.clone()
-                    pred[f"dense_p2d{i}_i{j}"] = ops.denormalize_keypoints(grid, size)
+                    pred[f"dense_p2d{i}_n{j}"] = warps[i].clone()
+                    pred[f"dense_p2d{i}_i{j}"] = ops.denormalize_keypoints(
+                        warps[i], size
+                    )
                     pred[f"dense_confidence{i}"] = torch.full((1, 1, 3), 0.8)
-                with patch.object(
-                    self.model,
-                    "cycle_error",
-                    return_value=(
-                        torch.tensor([[0.0, 2.0, 4.0]]),
-                        torch.ones(1, 3),
-                    ),
-                ) as cycle:
-                    actual = self.model.gate_dense(pred, context, *data, conf)
+                actual = self.model.gate_dense(pred, context, *data, conf)
                 expected = torch.tensor([[[True, True, distance != 3.0]]])
-                self.assertEqual(cycle.call_count, 2 if distance == 3.0 else 0)
                 for i in (0, 1):
                     self.assertTrue(torch.equal(actual[f"dense_valid{i}"], expected))
                     expected_confidence = torch.tensor(
