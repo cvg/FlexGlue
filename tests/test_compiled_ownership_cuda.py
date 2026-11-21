@@ -46,6 +46,8 @@ class CudaCompiledOwnershipTest(unittest.TestCase):
             copied.transformers[0].cross_attn.ffn[-1].bias.add_(2)
             expected = TransformerLayer.forward(copied.transformers[0], *args)
             actual = copied.transformers[0](*args)
+            self.assertEqual(len(actual), 2)
+            self.assertEqual(len(expected), 2)
             for a, e in zip(actual, expected):
                 self.assertEqual(a.dtype, torch.float64)
                 torch.testing.assert_close(a, e)
@@ -67,6 +69,8 @@ class CudaCompiledOwnershipTest(unittest.TestCase):
             features_reference = torch.compile(VGG19BN.forward, fullgraph=True)
             expected_features = features_reference(copied.refiner.features, image)
             actual_features = copied.refiner.extract(image, resize=(8, 8))
+            self.assertEqual(set(expected_features), {1, 2, 4})
+            self.assertEqual(set(actual_features), set(expected_features))
             for scale in expected_features:
                 torch.testing.assert_close(
                     actual_features[scale], expected_features[scale]
@@ -74,6 +78,8 @@ class CudaCompiledOwnershipTest(unittest.TestCase):
             refiner_reference = torch.compile(RoMav2Refiner.forward, fullgraph=True)
             expected = refiner_reference(copied.refiner, fine, fine, warp, logits)
             actual = copied.refiner(fine, fine, warp, logits)
+            self.assertEqual(len(actual), 2)
+            self.assertEqual(len(expected), 2)
             for a, e in zip(actual, expected):
                 torch.testing.assert_close(a, e)
 
