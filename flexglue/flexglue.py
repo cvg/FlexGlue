@@ -211,7 +211,7 @@ class FlexGlue(nn.Module):
     ) -> dict:
         """Dense grid 0 -> 1, and 1 -> 0 if symmetric, without matching."""
         conf = self.resolve_conf(conf)
-        if conf.max_distance_px and not symmetric:
+        if ops.is_set(conf.max_distance_px) and not symmetric:
             raise ValueError("max_distance_px needs symmetric=True.")
         data0, data1 = self.describe_inputs(data0, data1, conf)
         context = self.decode_pair(data0, data1, conf)
@@ -255,7 +255,7 @@ class FlexGlue(nn.Module):
         """Refined corresp. if refine is True, bidirectional under cycle check."""
         if not conf.refine:
             return {}
-        if conf.max_distance_px:
+        if ops.is_set(conf.max_distance_px):
             dirs = ((0, 1), (1, 0))
         data = (data0, data1)
         return {
@@ -478,7 +478,7 @@ class FlexGlue(nn.Module):
         """Pair, filter, cycle and border gates on grid confidence."""
         data = (data0, data1)
         is_covisible = context.covisibility_score >= conf.min_covisibility
-        if conf.min_covisibility > 0:
+        if ops.is_set(conf.min_covisibility):
             pred["is_covisible"] = is_covisible
         for i, j in ((0, 1), (1, 0)):
             if f"dense_confidence{i}" not in pred:
@@ -494,7 +494,7 @@ class FlexGlue(nn.Module):
             valid = valid & (dense_confidence >= conf.filter_threshold)
             valid &= ops.inside_border(dense_p2di_ri, size_i, border)
             valid &= ops.inside_border(dense_p2di_rj, size_j, border)
-            if conf.max_distance_px:
+            if ops.is_set(conf.max_distance_px):
                 dense_j = {
                     "dense_p2di_nj": pred[f"dense_p2d{j}_n{i}"],
                     "dense_confidencei": pred[f"dense_confidence{j}"],
