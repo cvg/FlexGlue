@@ -478,7 +478,7 @@ class FlexGlue(nn.Module):
         """Pair, filter, cycle and border gates on grid confidence."""
         data = (data0, data1)
         is_covisible = context.covisibility_score >= conf.min_covisibility
-        if conf.min_covisibility > 0:
+        if ops.is_set(conf.min_covisibility):
             pred["is_covisible"] = is_covisible
         for i, j in ((0, 1), (1, 0)):
             if f"dense_confidence{i}" not in pred:
