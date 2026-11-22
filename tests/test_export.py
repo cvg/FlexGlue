@@ -16,6 +16,33 @@ class TinyMatcher(nn.Module):
         self.heads = nn.ModuleList()
 
 
+class AttentionDispatchTest(unittest.TestCase):
+    def test_cross_attention_rechecks_callback_after_output_hook(self):
+        cross = modules.CrossBlock(8, 2)
+        native = modules.attention
+        x = torch.zeros(1, 3, 8)
+        y = torch.zeros(1, 4, 8)
+        calls = []
+
+        def before(q, k, v):
+            calls.append("before")
+            return native(q, k, v)
+
+        def after(q, k, v):
+            calls.append("after")
+            return native(q, k, v)
+
+        def rebind(_module, _args, _output):
+            modules.attention = after
+
+        with (
+            patch.object(modules, "attention", before),
+            cross.to_out.register_forward_hook(rebind),
+        ):
+            cross(x, y)
+        self.assertEqual(calls, ["before", "after"])
+
+
 class ExportIsolationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

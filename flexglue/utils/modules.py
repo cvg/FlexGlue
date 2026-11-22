@@ -123,9 +123,13 @@ class CrossBlock(nn.Module):
             for t in (self.to_qk(x0), self.to_qk(x1), self.to_v(x0), self.to_v(x1))
         )
         qk0, qk1 = self.qk_norm(qk0).to(v0.dtype), self.qk_norm(qk1).to(v1.dtype)
-        attend = attention if self.attention is None else self.attention
-        m0 = self.to_out(attend(qk0, qk1, v1))
-        m1 = self.to_out(attend(qk1, qk0, v0))
+        m0 = self.to_out(
+            (attention if self.attention is None else self.attention)(qk0, qk1, v1)
+        )
+        # A to_out hook can change the callback for the second direction.
+        m1 = self.to_out(
+            (attention if self.attention is None else self.attention)(qk1, qk0, v0)
+        )
         x0 = x0 + self.ffn(torch.cat([x0, self.message_norm(m0)], -1))
         x1 = x1 + self.ffn(torch.cat([x1, self.message_norm(m1)], -1))
         return x0, x1
