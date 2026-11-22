@@ -10,12 +10,14 @@ on:
     branches: [main]
     paths:
       - "flexglue/**"
+      - "tests/**"
       - "onnx/**"
       - "requirements.txt"
       - ".github/workflows/onnx_export.yml"
   pull_request:
     paths:
       - "flexglue/**"
+      - "tests/**"
       - "onnx/**"
       - "requirements.txt"
       - ".github/workflows/onnx_export.yml"
@@ -44,6 +46,9 @@ jobs:
           python -m pip install numpy opencv-python-headless \
             onnx==1.23.2 onnxscript==0.7.2 onnxruntime==1.23.2
           python -m pip install --no-deps -e .
+
+      - name: Run CPU unit tests
+        run: python -m unittest discover -s tests -v
 
       - name: Cache the weights
         uses: actions/cache@v4

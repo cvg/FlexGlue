@@ -239,9 +239,14 @@ def identity_matches(
 def pack_matches(pred: dict) -> dict:
     """Copy of pred with LightGlue-style lists matches (S, 2) and scores (S,) (sync)."""
     matches0, scores0 = pred["matches0"], pred["matching_scores0"]
-    valid = matches0 > -1
-    matches = [
-        torch.stack([torch.where(v)[0], m[v]], -1) for v, m in zip(valid, matches0)
+    matches, indices = [], []
+    for m in matches0:
+        idx = torch.where(m > -1)[0]
+        indices.append(idx)
+        matches.append(torch.stack([idx, m[idx]], -1))
+    # Keep independent score indices, and retain mask indexing's shape check.
+    scores = [
+        s[idx] if s.shape[:1] == m.shape else s[m > -1]
+        for s, m, idx in zip(scores0, matches0, indices)
     ]
-    scores = [s[v] for s, v in zip(scores0, valid)]
     return {**pred, "matches": matches, "scores": scores}
