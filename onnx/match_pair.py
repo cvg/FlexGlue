@@ -97,7 +97,7 @@ def detect_keypoints(image: np.ndarray, num_keypoints: int) -> np.ndarray:
     keypoints = cv2.SIFT_create(nfeatures=num_keypoints).detect(gray, None)
     keypoints = sorted(keypoints, key=lambda k: -k.response)
     # OpenCV returns a location once per dominant orientation: deduplicate.
-    points = np.array([k.pt for k in keypoints], dtype=np.float32)
+    points = np.array([k.pt for k in keypoints], dtype=np.float32).reshape(-1, 2)
     _, first = np.unique(points, axis=0, return_index=True)
     points = points[np.sort(first)][:num_keypoints]
     # OpenCV puts the center of the top-left pixel at (0, 0), FlexGlue at (0.5, 0.5).
@@ -195,7 +195,8 @@ def draw_matches(image0, image1, kpts0, kpts1, matches, scores, path):
         cv2.line(canvas, p0, p1, color, 1, cv2.LINE_AA)
         cv2.circle(canvas, p0, 2, color, -1, cv2.LINE_AA)
         cv2.circle(canvas, p1, 2, color, -1, cv2.LINE_AA)
-    cv2.imwrite(str(path), canvas)
+    if not cv2.imwrite(str(path), canvas):
+        raise OSError(f"Could not write matches to {path}")
     print(f"Saved the matches to {path}")
 
 
