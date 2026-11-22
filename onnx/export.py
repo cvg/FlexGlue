@@ -297,7 +297,6 @@ class SparseMatcherONNX(nn.Module):
                 "features": f,
                 "keypoints": k,
                 "image_size": s,
-                "resized_size": m.resized_size(f, s),  # as describe_inputs
             }
             for f, k, s in inputs
         )

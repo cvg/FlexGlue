@@ -21,6 +21,13 @@ from .utils.modules import (
 WEIGHTS_URL = "https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue.pth"
 
 
+def _sqrt_confidence(product: torch.Tensor) -> torch.Tensor:
+    """Keep signed zero and define its gradient as zero."""
+    zero = product == 0
+    safe_product = product.masked_fill(zero, 1)
+    return torch.where(zero, product.detach(), safe_product.sqrt())
+
+
 class FlexGlue(nn.Module):
     default_conf = {
         "input_dim": 256,
@@ -147,7 +154,7 @@ class FlexGlue(nn.Module):
         cycle: bool = True,
     ) -> dict:
         """Predicted point, confidence and validity of the keypoints, per direction."""
-        data = (data0, data1)
+        data = [data0, data1]
         pred = {
             "covisibility_score": context.covisibility_score,
             "stop_layer": context.layer,
@@ -165,6 +172,7 @@ class FlexGlue(nn.Module):
             pred[f"p2d{i}_n{j}"] = p2di_nj
             pred[f"p2d{i}_i{j}"] = ops.denormalize_keypoints(p2di_nj, size_j)
             if cycle and ops.is_set(conf.max_distance_px):
+                data[i] = self._with_resized_size(data[i])
                 error, back_confidence = self.cycle_error(
                     context,
                     i,
@@ -177,7 +185,7 @@ class FlexGlue(nn.Module):
                 # geometric mean of the forward and backward confidence
                 confidence = (confidence * back_confidence).sqrt()
             pred[f"confidence{i}"] = confidence
-        return self.gate_points(pred, context, data0, data1, conf)
+        return self.gate_points(pred, context, *data, conf)
 
     def match_pair(
         self,
@@ -236,18 +244,32 @@ class FlexGlue(nn.Module):
                     {"image": data_i["image"]}, resize=conf.describe_resize
                 )
                 data_i = {**described, **data_i}
-            resized = self.resized_size(data_i["features"], data_i["image_size"])
-            out.append({**data_i, "resized_size": resized})
+            out.append({**data_i, "resized_size": self.descriptor_size(data_i)})
         return tuple(out)
 
     def resized_size(
         self, features: torch.Tensor, image_size: torch.Tensor
     ) -> torch.Tensor:
-        """(B, 2) w, h of the descriptor input, the frame of distances and borders."""
-        h, w = (self.stride * s for s in features.shape[-2:])
-        # filled on the device: new_tensor would block on a host-to-device copy
-        b = image_size.shape[:1]
-        return torch.stack([image_size.new_full(b, s) for s in (w, h)], -1)
+        """Descriptor input size (B, 2), in (width, height) pixels."""
+        h, w = features.shape[-2:]
+        return torch.stack(
+            [
+                image_size.new_full(
+                    image_size.shape[:1], self.stride * s, dtype=torch.float32
+                )
+                for s in (w, h)
+            ],
+            -1,
+        )
+
+    def descriptor_size(self, data_i: dict) -> torch.Tensor:
+        """Derive the descriptor frame from the feature grid."""
+        return self.resized_size(data_i["features"], data_i["image_size"])
+
+    def _with_resized_size(self, data_i: dict) -> dict:
+        if "resized_size" in data_i:
+            return data_i
+        return {**data_i, "resized_size": self.descriptor_size(data_i)}
 
     def prepare_dense(
         self, context: PairContext, data0: dict, data1: dict, dirs: List[tuple], conf
@@ -444,26 +466,38 @@ class FlexGlue(nn.Module):
         error = (back_ii - ops.denormalize_keypoints(points_ni, size_i)).norm(dim=-1)
         return error, back_confidence
 
-    def to_resized(self, points: torch.Tensor, data_i: dict) -> torch.Tensor:
+    def to_resized(
+        self, points: torch.Tensor, data_i: dict, size: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Points (B, ..., 2) from pixels of image i to descriptor input pixels."""
-        scale = data_i["resized_size"] / data_i["image_size"]
+        if size is None:
+            size = data_i.get("resized_size")
+        if size is None:
+            size = self.descriptor_size(data_i)
+        dtype = torch.promote_types(
+            torch.promote_types(points.dtype, size.dtype), torch.float32
+        )
+        scale = size.to(device=points.device, dtype=dtype) / data_i["image_size"]
         return points * scale.view(scale.shape[0], *[1] * (points.dim() - 2), 2)
 
     def gate_points(
         self, pred: dict, context: PairContext, data0: dict, data1: dict, conf
     ) -> dict:
         """Pair, cycle and border checks on keypoints (valid{i}), in resized pixels."""
-        data = (data0, data1)
+        data = None
         is_covisible = context.covisibility_score >= conf.min_covisibility
         if ops.is_set(conf.min_covisibility):
             pred["is_covisible"] = is_covisible
         for i, j in ((0, 1), (1, 0)):
             if f"confidence{i}" not in pred:
                 continue
-            size_i, size_j = data[i]["resized_size"], data[j]["resized_size"]
+            if data is None:
+                data = (self._with_resized_size(data0), self._with_resized_size(data1))
+            data_i, data_j = data[i], data[j]
+            size_i, size_j = data_i["resized_size"], data_j["resized_size"]
             border = size_i.new_full(size_i.shape[:1], conf.remove_border_px)
-            kpts_ri = self.to_resized(data[i]["keypoints"], data[i])
-            p2di_rj = self.to_resized(pred[f"p2d{i}_i{j}"], data[j])
+            kpts_ri = self.to_resized(data_i["keypoints"], data_i)
+            p2di_rj = self.to_resized(pred[f"p2d{i}_i{j}"], data_j)
             valid = is_covisible[:, None]
             valid = valid & ops.inside_border(kpts_ri, size_i, border)
             valid &= ops.inside_border(p2di_rj, size_j, border)
@@ -476,20 +510,23 @@ class FlexGlue(nn.Module):
         self, pred: dict, context: PairContext, data0: dict, data1: dict, conf
     ) -> dict:
         """Pair, filter, cycle and border gates on grid confidence."""
-        data = (data0, data1)
+        data = None
         is_covisible = context.covisibility_score >= conf.min_covisibility
         if conf.min_covisibility > 0:
             pred["is_covisible"] = is_covisible
         for i, j in ((0, 1), (1, 0)):
             if f"dense_confidence{i}" not in pred:
                 continue
-            size_i, size_j = data[i]["resized_size"], data[j]["resized_size"]
+            if data is None:
+                data = (self._with_resized_size(data0), self._with_resized_size(data1))
+            data_i, data_j = data[i], data[j]
+            size_i, size_j = data_i["resized_size"], data_j["resized_size"]
             border = size_i.new_full(size_i.shape[:1], conf.remove_border_px)
             dense_p2di_nj = pred[f"dense_p2d{i}_n{j}"]
             dense_confidence = pred[f"dense_confidence{i}"]
             dense_p2di_ni = ops.grid_sources(dense_p2di_nj)
             dense_p2di_ri = ops.denormalize_keypoints(dense_p2di_ni, size_i)
-            dense_p2di_rj = self.to_resized(pred[f"dense_p2d{i}_i{j}"], data[j])
+            dense_p2di_rj = self.to_resized(pred[f"dense_p2d{i}_i{j}"], data_j)
             valid = is_covisible[:, None, None]
             valid = valid & (dense_confidence >= conf.filter_threshold)
             valid &= ops.inside_border(dense_p2di_ri, size_i, border)
@@ -514,48 +551,74 @@ class FlexGlue(nn.Module):
 
     def sparse_matches(self, pred: dict, data0: dict, data1: dict, conf) -> dict:
         """Mutual nearest neighbours of keypoints and predicted points."""
-        size0, size1 = data0["resized_size"], data1["resized_size"]
-        kpts0 = self.to_resized(data0["keypoints"], data0)
-        kpts1 = self.to_resized(data1["keypoints"], data1)
-        p2d0_i1 = self.to_resized(pred["p2d0_i1"], data1)
-        p2d1_i0 = self.to_resized(pred["p2d1_i0"], data0)
+        if not data0["keypoints"].shape[1] or not data1["keypoints"].shape[1]:
+            dtype = torch.promote_types(
+                pred["confidence0"].dtype, pred["confidence1"].dtype
+            )
+            result = {}
+            for i in (0, 1):
+                confidence = pred[f"confidence{i}"]
+                matches = torch.full_like(confidence, -1, dtype=torch.long)
+                result[f"matches{i}"] = matches
+                # Preserve the zero-gradient connection of rejected scores.
+                result[f"matching_scores{i}"] = torch.where(
+                    matches >= 0, confidence, 0
+                ).to(dtype)
+            return result
+        data0, data1 = self._with_resized_size(data0), self._with_resized_size(data1)
+        # Geometry controls discrete selection; confidence keeps its gradients.
+        kpts0 = self.to_resized(data0["keypoints"], data0).detach()
+        kpts1 = self.to_resized(data1["keypoints"], data1).detach()
+        p2d0_i1 = self.to_resized(pred["p2d0_i1"], data1).detach()
+        p2d1_i0 = self.to_resized(pred["p2d1_i0"], data0).detach()
         if conf.gemm_nn:  # centered on each image for float32 precision
+            size0, size1 = data0["resized_size"], data1["resized_size"]
             c0, c1 = size0[:, None] / 2, size1[:, None] / 2
             x = torch.cat([p2d0_i1 - c1, kpts0 - c0], -1)
             y = torch.cat([kpts1 - c1, p2d1_i0 - c0], -1)
             sq_dist = ops.sq_dist if conf.exact_nn else ops.sq_dist_gemm
-            m0, m1 = ops.mutual_nn(sq_dist(x, y))
-
-            # exact mean distance of the selected pairs only
-            def take(t: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-                return t.gather(1, m.clamp(0)[..., None].expand(-1, -1, 2))
-
-            dist0 = 0.5 * (
-                (p2d0_i1 - take(kpts1, m0)).norm(dim=-1)
-                + (kpts0 - take(p2d1_i0, m0)).norm(dim=-1)
-            )
-            dist1 = 0.5 * (
-                (take(p2d0_i1, m1) - kpts1).norm(dim=-1)
-                + (take(kpts0, m1) - p2d1_i0).norm(dim=-1)
-            )
+            dist = sq_dist(x, y)
         else:
             dist = 0.5 * (torch.cdist(p2d0_i1, kpts1) + torch.cdist(kpts0, p2d1_i0))
-            m0, m1 = ops.mutual_nn(dist)
-            dist0, dist1 = dist.min(2).values, dist.min(1).values
+        # Rejected nonfinite predictions must not steal finite mutual neighbors.
+        dist.nan_to_num_(nan=torch.inf, posinf=torch.inf, neginf=torch.inf)
+        check_distance = ops.is_set(conf.max_distance_px)
+        nearest = ops.mutual_nn(
+            dist, return_distances=check_distance and not conf.gemm_nn
+        )
+        m0, m1 = nearest[:2]
+        del dist  # Neither branch needs the full distance matrix again.
+        idx0, idx1 = m0.clamp(0), m1.clamp(0)
+
+        if check_distance and conf.gemm_nn:
+            # exact mean distance of the selected pairs only
+            def take(t: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+                return t.gather(1, m[..., None].expand(-1, -1, 2))
+
+            dist0 = 0.5 * (
+                (p2d0_i1 - take(kpts1, idx0)).norm(dim=-1)
+                + (kpts0 - take(p2d1_i0, idx0)).norm(dim=-1)
+            )
+            dist1 = 0.5 * (
+                (take(p2d0_i1, idx1) - kpts1).norm(dim=-1)
+                + (take(kpts0, idx1) - p2d1_i0).norm(dim=-1)
+            )
+        elif check_distance:
+            dist0, dist1 = nearest[2:]
         # geometric mean of both confidences, as the cycle score
-        scores0 = (
-            pred["confidence0"] * pred["confidence1"].gather(1, m0.clamp(0))
-        ).sqrt()
-        scores1 = (
-            pred["confidence1"] * pred["confidence0"].gather(1, m1.clamp(0))
-        ).sqrt()
+        products0 = pred["confidence0"] * pred["confidence1"].gather(1, idx0)
+        products1 = pred["confidence1"] * pred["confidence0"].gather(1, idx1)
+        scores0, scores1 = products0.sqrt(), products1.sqrt()
         valid0 = (m0 > -1) & (scores0 >= conf.filter_threshold)
         valid1 = (m1 > -1) & (scores1 >= conf.filter_threshold)
-        valid0 &= pred["valid0"] & pred["valid1"].gather(1, m0.clamp(0))
-        valid1 &= pred["valid1"] & pred["valid0"].gather(1, m1.clamp(0))
-        if ops.is_set(conf.max_distance_px):  # dist and scale average both images
+        valid0 &= pred["valid0"] & pred["valid1"].gather(1, idx0)
+        valid1 &= pred["valid1"] & pred["valid0"].gather(1, idx1)
+        if check_distance:  # dist and scale average both images
             valid0 &= dist0 < conf.max_distance_px
             valid1 &= dist1 < conf.max_distance_px
+        if torch.is_grad_enabled():
+            scores0 = _sqrt_confidence(torch.where(valid0, products0, 1))
+            scores1 = _sqrt_confidence(torch.where(valid1, products1, 1))
         return {
             "matches0": torch.where(valid0, m0, -1),
             "matches1": torch.where(valid1, m1, -1),

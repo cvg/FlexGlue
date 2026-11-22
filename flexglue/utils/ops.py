@@ -134,12 +134,23 @@ def is_set(threshold) -> bool:
     )
 
 
-def mutual_nn(dist: torch.Tensor):
-    """Mutual nearest neighbors of a (B, M, N) distance matrix, -1 if not mutual."""
+def mutual_nn(dist: torch.Tensor, *, return_distances: bool = False):
+    """Mutual NN indices, optionally followed by row/column minimum distances.
+
+    Non-mutual indices are -1; optional distances still describe the nearest
+    neighbor before mutual filtering. Eager PyTorch follows argmin/min NaN
+    behavior. Sanitize NaNs before export: ONNX runtimes can differ.
+    """
     m0, m1 = dist.argmin(2), dist.argmin(1)
+    minima = ()
+    if return_distances:
+        minima = (
+            dist.gather(2, m0[..., None]).squeeze(2),
+            dist.gather(1, m1[:, None]).squeeze(1),
+        )
     mutual0 = torch.arange(m0.shape[1], device=m0.device) == m1.gather(1, m0)
     mutual1 = torch.arange(m1.shape[1], device=m1.device) == m0.gather(1, m1)
-    return torch.where(mutual0, m0, -1), torch.where(mutual1, m1, -1)
+    return torch.where(mutual0, m0, -1), torch.where(mutual1, m1, -1), *minima
 
 
 def inside_border(
