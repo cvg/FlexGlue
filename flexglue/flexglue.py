@@ -83,9 +83,14 @@ class FlexGlue(nn.Module):
             ]
         )
         self.loaded_heads = set(range(conf.n_layers + 1))
+        loader = self.load_weights if conf.weights is not None else None
+        stock_loader = (
+            getattr(loader, "__func__", None) is FlexGlue._stock_load_weights
+            and getattr(loader, "__self__", None) is self
+        )
         state_dict = (
             ops._read_state_dict(conf.weights, allow_mmap=conf.mmap_weights)
-            if conf.weights is not None and conf.describe
+            if stock_loader and conf.describe
             else None
         )
         source_unique = (
@@ -94,11 +99,14 @@ class FlexGlue(nn.Module):
             else False
         )
         if conf.weights is not None:
-            self.load_weights(
-                conf.weights,
-                state_dict=state_dict,
-                _assign_during_init=conf.mmap_weights,
-            )
+            if stock_loader:
+                loader(
+                    conf.weights,
+                    state_dict=state_dict,
+                    _assign_during_init=conf.mmap_weights,
+                )
+            else:
+                loader(conf.weights)
         if state_dict is not None:
             # Retire matcher tensors after copying them into the model.
             state_dict = {
@@ -671,14 +679,39 @@ class FlexGlue(nn.Module):
             if parts[0] in ("transformers", "heads") and int(parts[1]) >= limit:
                 continue  # truncated model: layers past n_layers are not built
             state_dict[k] = v
+        # Registered migration hooks and custom loaders must see the checkpoint
+        # before PyTorch decides which keys are missing or unexpected.
+        load_state = self.load_state_dict
+        custom_load = (
+            getattr(load_state, "__func__", None) is not nn.Module.load_state_dict
+            or getattr(load_state, "__self__", None) is not self
+            or any(
+                module._load_state_dict_pre_hooks
+                or module._load_state_dict_post_hooks
+                or getattr(module._load_from_state_dict, "__func__", None)
+                is not nn.Module._load_from_state_dict
+                or getattr(module._load_from_state_dict, "__self__", None) is not module
+                for name, module in self.named_modules()
+                if name not in ("descriptor", "refiner")
+                and not name.startswith(("descriptor.", "refiner."))
+            )
+        )
+        if custom_load:
+            load_missing, load_unexpected = load_state(state_dict, strict=False)
         # A reload owns only matcher parameters; descriptor/refiner state is separate.
         expected = {
             k: v
             for k, v in self.state_dict().items()
             if not k.startswith(("descriptor.", "refiner."))
         }
-        missing = expected.keys() - state_dict.keys()
-        unexpected = state_dict.keys() - expected.keys()
+        if custom_load:
+            missing = {
+                k for k in load_missing if not k.startswith(("descriptor.", "refiner."))
+            }
+            unexpected = set(load_unexpected)
+        else:
+            missing = expected.keys() - state_dict.keys()
+            unexpected = state_dict.keys() - expected.keys()
         if unexpected:
             raise KeyError(f"Unexpected weights: {sorted(unexpected)}")
         if any(not k.startswith("heads.") for k in missing):
@@ -686,33 +719,37 @@ class FlexGlue(nn.Module):
         partial = {int(k.split(".")[1]) for k in missing}
         for layer in partial:
             prefix = f"heads.{layer}."
-            if any(k.startswith(prefix) for k in state_dict):
+            if any(k.startswith(prefix) for k in expected.keys() - missing):
                 raise KeyError(f"Head {layer} is only partially in the weights.")
-        for k, v in state_dict.items():
-            if not torch.overrides.is_tensor_like(v):
-                raise TypeError(f"Expected tensor-like weight for {k}.")
-            if isinstance(v, torch.Tensor) and (
-                v.is_meta or v.is_quantized or v.layout != torch.strided
-            ):
-                raise TypeError(
-                    f"Weight {k} must be a materialized, non-quantized strided tensor."
-                )
-            # PyTorch accepts a one-dimensional legacy value for a scalar.
-            legacy_scalar = expected[k].ndim == 0 and v.ndim == 1 and v.numel() > 0
-            if not legacy_scalar and v.shape != expected[k].shape:
-                raise RuntimeError(
-                    f"size mismatch for {k}: {tuple(v.shape)} != "
-                    f"{tuple(expected[k].shape)}"
-                )
-        ops.load_into_module(
-            self,
-            state_dict,
-            weights,
-            strict=False,
-            source_unique=source_unique,
-            allow_assign=_assign_during_init,
-        )
+        if not custom_load:
+            for k, v in state_dict.items():
+                if not torch.overrides.is_tensor_like(v):
+                    raise TypeError(f"Expected tensor-like weight for {k}.")
+                if isinstance(v, torch.Tensor) and (
+                    v.is_meta or v.is_quantized or v.layout != torch.strided
+                ):
+                    raise TypeError(
+                        f"Weight {k} must be a materialized, non-quantized "
+                        "strided tensor."
+                    )
+                # PyTorch accepts a one-dimensional legacy value for a scalar.
+                legacy_scalar = expected[k].ndim == 0 and v.ndim == 1 and v.numel() > 0
+                if not legacy_scalar and v.shape != expected[k].shape:
+                    raise RuntimeError(
+                        f"size mismatch for {k}: {tuple(v.shape)} != "
+                        f"{tuple(expected[k].shape)}"
+                    )
+            ops.load_into_module(
+                self,
+                state_dict,
+                weights,
+                strict=False,
+                source_unique=source_unique,
+                allow_assign=_assign_during_init,
+            )
         self.loaded_heads = set(range(self.conf.n_layers + 1)) - partial
+
+    _stock_load_weights = load_weights
 
     def resolve_conf(self, conf: dict) -> SimpleNamespace:
         """Merge per-call overrides with the construction conf."""

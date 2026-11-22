@@ -290,6 +290,82 @@ class WeightLoadingTest(unittest.TestCase):
         for name, value in actual.state_dict().items():
             self.assertTrue(torch.equal(value, self.original.state_dict()[name]))
 
+    def test_legacy_load_weights_overrides_receive_one_argument_before_reads(self):
+        class Descriptor(nn.Module):
+            def __init__(self, *, weights, state_dict, **kwargs):
+                super().__init__()
+                self.source = state_dict
+                self.raw = ops.load_state_dict(
+                    weights, "extractor.", state_dict=state_dict
+                )
+
+        base_loader = FlexGlue.load_weights
+        for describe in (False, True):
+            for mapped in (False, True):
+                for style in ("subclass", "class"):
+                    with self.subTest(describe=describe, mapped=mapped, style=style):
+                        state = {**self.state, "extractor.x": torch.tensor([3.0])}
+                        torch.save(state, self.path)
+                        calls = []
+                        with patch.object(
+                            ops, "_read_state_dict", wraps=ops._read_state_dict
+                        ) as read:
+
+                            def override(instance, weights):
+                                calls.append((instance, weights, read.call_count))
+                                return base_loader(instance, weights)
+
+                            class Custom(FlexGlue):
+                                load_weights = override
+
+                            patcher = (
+                                patch.object(FlexGlue, "load_weights", override)
+                                if style == "class"
+                                else patch.object(FlexGlue, "load_weights", base_loader)
+                            )
+                            with patcher, patch(
+                                "flexglue.flexglue.DINOv3Descriptor", Descriptor
+                            ):
+                                cls = FlexGlue if style == "class" else Custom
+                                model = cls(
+                                    weights=self.path,
+                                    **{
+                                        **self.conf,
+                                        "describe": describe,
+                                        "mmap_weights": mapped,
+                                    },
+                                )
+                        self.assertEqual(calls, [(model, self.path, 0)])
+                        self.assertEqual(read.call_count, 2 if describe else 1)
+                        self.assertEqual(model.loaded_heads, {0, 1, 2})
+                        for name, value in self.original.state_dict().items():
+                            self.assertTrue(
+                                torch.equal(model.state_dict()[name], value)
+                            )
+                        if describe:
+                            self.assertIsNone(model.descriptor.source)
+                            self.assertTrue(
+                                torch.equal(
+                                    model.descriptor.raw["x"], state["extractor.x"]
+                                )
+                            )
+
+    def test_original_loader_bound_to_another_instance_is_not_bypassed(self):
+        other = FlexGlue(weights=None, **self.conf)
+        torch.save(self.state, self.path)
+
+        class Rebound(FlexGlue):
+            def __getattribute__(self, name):
+                if name == "load_weights":
+                    return other.load_weights
+                return super().__getattribute__(name)
+
+        with patch.object(ops, "_read_state_dict", wraps=ops._read_state_dict) as read:
+            Rebound(weights=self.path, **self.conf)
+        self.assertEqual(read.call_count, 1)
+        for name, value in self.original.state_dict().items():
+            self.assertTrue(torch.equal(other.state_dict()[name], value))
+
     def test_default_constructor_copies_independent_of_checkpoint_rewrite(self):
         actual = self.build()
         before = {k: v.detach().clone() for k, v in actual.state_dict().items()}
@@ -469,6 +545,102 @@ class WeightLoadingTest(unittest.TestCase):
     def test_unexpected_key_rejected(self):
         with self.assertRaisesRegex(KeyError, "Unexpected weights"):
             self.build({**self.state, "matcher.unexpected": torch.tensor(1)})
+
+    def test_child_load_hook_migrates_keys_on_construction_and_reload(self):
+        state = dict(self.state)
+        state["matcher.input_proj.legacy_weight"] = state.pop(
+            "matcher.input_proj.weight"
+        )
+        torch.save(state, self.path)
+        calls = []
+
+        def migrate(module, values, prefix, *args):
+            calls.append(prefix)
+            values[prefix + "weight"] = values.pop(prefix + "legacy_weight")
+
+        class Hooked(FlexGlue):
+            def load_weights(self, weights):
+                with self.input_proj.register_load_state_dict_pre_hook(migrate):
+                    super().load_weights(weights)
+
+        with patch.object(
+            ops, "load_into_module", side_effect=AssertionError("assign")
+        ):
+            model = Hooked(weights=self.path, **self.conf)
+            model.descriptor = nn.Linear(3, 2)
+            model.refiner = nn.Linear(2, 1)
+            unrelated = {
+                k: v.clone()
+                for k, v in model.state_dict().items()
+                if k.startswith(("descriptor.", "refiner."))
+            }
+            model.load_weights(self.path)
+        self.assertEqual(calls, ["input_proj.", "input_proj."])
+        self.assertTrue(
+            torch.equal(model.input_proj.weight, self.original.input_proj.weight)
+        )
+        for key, value in unrelated.items():
+            self.assertTrue(torch.equal(model.state_dict()[key], value))
+
+    def test_child_hook_head_bookkeeping_uses_post_hook_missing_keys(self):
+        torch.save(self.state, self.path)
+        for remove_all in (False, True):
+            with self.subTest(remove_all=remove_all):
+                model = FlexGlue(weights=None, **self.conf)
+
+                def remove(module, values, prefix, *args):
+                    keys = [k for k in values if k.startswith(prefix)]
+                    for key in keys if remove_all else keys[:1]:
+                        del values[key]
+
+                with model.heads[1].register_load_state_dict_pre_hook(remove):
+                    if remove_all:
+                        model.load_weights(self.path)
+                        self.assertEqual(model.loaded_heads, {0, 2})
+                    else:
+                        with self.assertRaisesRegex(KeyError, "only partially"):
+                            model.load_weights(self.path)
+
+    def test_custom_load_state_dict_receives_checkpoint_before_validation(self):
+        state = dict(self.state)
+        state["matcher.input_proj.legacy_weight"] = state.pop(
+            "matcher.input_proj.weight"
+        )
+        torch.save(state, self.path)
+        calls = []
+
+        class Custom(FlexGlue):
+            def load_state_dict(self, values, strict=True):
+                calls.append(strict)
+                values = dict(values)
+                values["input_proj.weight"] = values.pop("input_proj.legacy_weight")
+                return super().load_state_dict(values, strict=strict)
+
+        with patch.object(
+            ops, "load_into_module", side_effect=AssertionError("assign")
+        ):
+            model = Custom(weights=self.path, mmap_weights=True, **self.conf)
+        self.assertEqual(calls, [False])
+        self.assertTrue(
+            torch.equal(model.input_proj.weight, self.original.input_proj.weight)
+        )
+
+    def test_nonmatcher_loaders_do_not_disable_matcher_preflight(self):
+        model = self.build()
+        model.refiner = nn.BatchNorm2d(2)
+        model.descriptor = nn.Linear(3, 2)
+        original = model.input_proj.weight.detach().clone()
+        invalid = dict(self.state)
+        invalid["matcher.input_proj.weight"] = torch.full_like(original, 17)
+        del invalid["matcher.input_proj.bias"]
+
+        def unrelated_hook(*args):
+            raise AssertionError("preflight should reject before descriptor hook")
+
+        with model.descriptor.register_load_state_dict_pre_hook(unrelated_hook):
+            with self.assertRaisesRegex(KeyError, "Missing weights"):
+                model.load_weights(self.path, state_dict=invalid)
+        torch.testing.assert_close(model.input_proj.weight, original, rtol=0, atol=0)
 
     def test_empty_checkpoint_rejected(self):
         with self.assertRaisesRegex(KeyError, "No weights with prefix 'matcher.'"):
