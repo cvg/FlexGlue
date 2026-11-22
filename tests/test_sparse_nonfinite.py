@@ -1,8 +1,8 @@
-"""Public matcher regression: rejected geometry must not steal finite matches.
+"""Public sparse regressions for rejected geometry and zero confidence.
 
 Use PYTHONPATH=<exact source/worktree> python this_file.py. No checkpoint needed.
-Only the learned prediction boundary is replaced with deterministic outputs;
-describe_inputs, decode_pair, normalization, gating, NN selection, and packing run.
+Geometry probes replace learned predictions with deterministic outputs; all
+matching consumers run. The zero-confidence regression uses the actual model.
 """
 
 import unittest
@@ -101,6 +101,60 @@ class RejectedSparseGeometryTest(unittest.TestCase):
             for direction in (0, 1):
                 with self.subTest(gemm=gemm, exact=exact, direction=direction):
                     self.run_case(gemm, exact, direction, 0, 2.0)
+
+    def test_rejected_zero_confidence_has_finite_model_gradients(self):
+        model = FlexGlue(**{**vars(self.model.conf), "n_layers": 1}).eval()
+        with torch.no_grad():
+            model.heads[1].matchability.weight.zero_()
+            model.heads[1].matchability.bias.fill_(-100)
+        result = model.match(self.data, self.data, sparse=True, max_distance_px=0)
+        for direction in (0, 1):
+            for field in ("confidence", "matches", "matching_scores"):
+                self.assertEqual(result[f"{field}{direction}"].shape, (1, 3))
+            self.assertEqual(result[f"confidence{direction}"].count_nonzero(), 0)
+            self.assertTrue((result[f"matches{direction}"] == -1).all())
+            self.assertEqual(result[f"matching_scores{direction}"].count_nonzero(), 0)
+        sum(result[f"matching_scores{i}"].sum() for i in (0, 1)).backward()
+        self.assertIsNotNone(model.heads[1].matchability.bias.grad)
+        gradients = [p.grad for p in model.parameters() if p.grad is not None]
+        self.assertTrue(gradients)
+        for gradient in gradients:
+            self.assertTrue(gradient.isfinite().all())
+            self.assertEqual(gradient.count_nonzero(), 0)
+
+    def test_sparse_confidence_gradients_ignore_rejected_zero_products(self):
+        for gemm, exact in ((True, False), (True, True), (False, False)):
+            with self.subTest(gemm=gemm, exact=exact):
+                confidence0 = torch.tensor([[0.0, 0.16, 0.36]], requires_grad=True)
+                confidence1 = torch.tensor([[0.25, 0.0, 0.49]], requires_grad=True)
+                pred = {
+                    "p2d0_i1": self.data["keypoints"],
+                    "p2d1_i0": self.data["keypoints"],
+                    "confidence0": confidence0,
+                    "confidence1": confidence1,
+                    "valid0": torch.ones(1, 3, dtype=torch.bool),
+                    "valid1": torch.ones(1, 3, dtype=torch.bool),
+                }
+                conf = self.model.resolve_conf(
+                    {"gemm_nn": gemm, "exact_nn": exact, "max_distance_px": 1.0}
+                )
+                result = self.model.sparse_matches(pred, self.data, self.data, conf)
+                for direction in (0, 1):
+                    torch.testing.assert_close(
+                        result[f"matches{direction}"], torch.tensor([[-1, -1, 2]])
+                    )
+                    expected = (confidence0.detach() * confidence1.detach()).sqrt()
+                    torch.testing.assert_close(
+                        result[f"matching_scores{direction}"], expected, rtol=0, atol=0
+                    )
+                loss = sum(result[f"matching_scores{i}"].sum() for i in (0, 1))
+                gradients = torch.autograd.grad(loss, (confidence0, confidence1))
+                for gradient, expected in zip(
+                    gradients, ([[0.0, 0.0, 7 / 6]], [[0.0, 0.0, 6 / 7]])
+                ):
+                    torch.testing.assert_close(
+                        gradient, gradient.new_tensor(expected), rtol=1e-6, atol=0
+                    )
 
 
 if __name__ == "__main__":

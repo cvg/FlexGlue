@@ -585,8 +585,9 @@ class FlexGlue(nn.Module):
         elif check_distance:
             dist0, dist1 = nearest[2:]
         # geometric mean of both confidences, as the cycle score
-        scores0 = (pred["confidence0"] * pred["confidence1"].gather(1, idx0)).sqrt()
-        scores1 = (pred["confidence1"] * pred["confidence0"].gather(1, idx1)).sqrt()
+        products0 = pred["confidence0"] * pred["confidence1"].gather(1, idx0)
+        products1 = pred["confidence1"] * pred["confidence0"].gather(1, idx1)
+        scores0, scores1 = products0.sqrt(), products1.sqrt()
         valid0 = (m0 > -1) & (scores0 >= conf.filter_threshold)
         valid1 = (m1 > -1) & (scores1 >= conf.filter_threshold)
         valid0 &= pred["valid0"] & pred["valid1"].gather(1, idx0)
@@ -594,6 +595,10 @@ class FlexGlue(nn.Module):
         if check_distance:  # dist and scale average both images
             valid0 &= dist0 < conf.max_distance_px
             valid1 &= dist1 < conf.max_distance_px
+        if torch.is_grad_enabled():
+            # Rejected zero products must not enter sqrt's backward division.
+            scores0 = torch.where(valid0, products0, 1).sqrt()
+            scores1 = torch.where(valid1, products1, 1).sqrt()
         return {
             "matches0": torch.where(valid0, m0, -1),
             "matches1": torch.where(valid1, m1, -1),
