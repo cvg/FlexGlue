@@ -21,6 +21,13 @@ from .utils.modules import (
 WEIGHTS_URL = "https://github.com/cvg/FlexGlue/releases/download/v0.1/flexglue.pth"
 
 
+def _sqrt_confidence(product: torch.Tensor) -> torch.Tensor:
+    """Keep signed zero and define its gradient as zero."""
+    zero = product == 0
+    safe_product = product.masked_fill(zero, 1)
+    return torch.where(zero, product.detach(), safe_product.sqrt())
+
+
 class FlexGlue(nn.Module):
     default_conf = {
         "input_dim": 256,
@@ -610,9 +617,8 @@ class FlexGlue(nn.Module):
             valid0 &= dist0 < conf.max_distance_px
             valid1 &= dist1 < conf.max_distance_px
         if torch.is_grad_enabled():
-            # Rejected zero products must not enter sqrt's backward division.
-            scores0 = torch.where(valid0, products0, 1).sqrt()
-            scores1 = torch.where(valid1, products1, 1).sqrt()
+            scores0 = _sqrt_confidence(torch.where(valid0, products0, 1))
+            scores1 = _sqrt_confidence(torch.where(valid1, products1, 1))
         return {
             "matches0": torch.where(valid0, m0, -1),
             "matches1": torch.where(valid1, m1, -1),
