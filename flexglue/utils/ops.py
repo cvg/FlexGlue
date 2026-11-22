@@ -161,7 +161,14 @@ def grid_sources(grid: torch.Tensor) -> torch.Tensor:
 def sample_cells(weights: torch.Tensor, n: int) -> tuple:
     """Sample at most n unique cells of (B, N) weights: indices (B, n), (B, n, 2)."""
     n = min(n, weights.shape[1])
-    idx = torch.multinomial(weights.clamp_min(1e-12), n, replacement=False)
+    if n == 0:
+        idx = weights.new_empty((weights.shape[0], 0), dtype=torch.long)
+    else:
+        probabilities = weights.clamp_min(1e-12)
+        if weights.dtype == torch.float16:
+            # The floor rounds to zero in Half; sample empty rows uniformly.
+            probabilities.masked_fill_(~probabilities.any(dim=-1, keepdim=True), 1)
+        idx = torch.multinomial(probabilities, n, replacement=False)
     return idx, idx[..., None].expand(-1, -1, 2)
 
 
