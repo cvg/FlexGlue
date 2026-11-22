@@ -200,34 +200,31 @@ def lattice_kde(
     strides = size ** torch.arange(d - 1, -1, -1, device=points.device)
     point_idx = (base * strides).sum(-1)
     corner_idx = (corners * strides).sum(-1)
+    del u, base, strides
+    # Finish the native tent product before expanding the corner addresses.
+    factors = torch.where(corners.bool(), frac[:, :, None], 1 - frac[:, :, None])
+    del frac, corners
+    tent = factors.prod(-1)
+    del factors
     idx = (point_idx[..., None] + corner_idx).flatten(1)  # (B, N * 2^d)
-    # Retire address construction before the large corner-weight product.
-    del u, base, point_idx, corner_idx, strides
-    f, *rest = frac.unbind(-1)
-    tent = torch.stack((1 - f, f), -1)
-    for f in rest:
-        tent = (tent[..., None] * torch.stack((1 - f, f), -1)[:, :, None]).flatten(-2)
-    del f, rest, frac, corners
+    del point_idx, corner_idx
     lattice = tent.new_zeros(b, size**d)
     lattice.scatter_add_(1, idx, (tent * weights[..., None].float()).flatten(1))
     # splat and read tents add pitch^2 / 6 each
     k = torch.arange(-r, r + 1, device=points.device, dtype=lattice.dtype) * pitch
     kernel = (std / s * torch.exp(-(k**2) / (2 * s**2))).view(1, 1, -1)
-    # Treat independent lines as depthwise channels.
-    channels = size if d > 1 else 1
-    kernel = kernel.expand(channels, 1, -1)
     lattice = lattice.view(b, *[size] * d)
     for dim in range(1, d + 1):
         x = lattice.movedim(dim, -1)
         shape = x.shape
-        x = x.reshape(-1, channels, size).contiguous()
+        x = x.reshape(-1, 1, size)
         # Retire the old layout before the convolution allocates its workspace.
         del lattice
-        x = F.conv1d(x, kernel, padding=r, groups=channels).view(shape)
-        lattice = x.movedim(-1, dim)
+        lattice = F.conv1d(x, kernel, padding=r).view(shape).movedim(-1, dim)
+        del x
     lattice = lattice.reshape(b, -1)
     values = lattice.gather(1, idx).view_as(tent)
-    del lattice, x, idx
+    del lattice, idx
     return (values * tent).sum(-1)
 
 

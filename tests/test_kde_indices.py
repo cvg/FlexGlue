@@ -130,6 +130,63 @@ class KdeIndexTest(unittest.TestCase):
                 for a, b in zip(*inputs):
                     self.assertTrue(torch.equal(a.grad, b.grad))
 
+    def test_corner_weights_keep_native_values_and_gradients(self):
+        scatter_add = torch.Tensor.scatter_add_
+        for d in (1, 2, 4):
+            with self.subTest(dimensions=d):
+                rng = torch.Generator().manual_seed(194 + d)
+                points = torch.rand(1, 64, d, generator=rng) * 1.8 - 0.9
+                weights = torch.rand(1, 64, generator=rng)
+                points[0, :2] = torch.tensor([[-1.0] * d, [1.0] * d])
+                weights[0, 0] = 0
+                inputs = tuple(x.requires_grad_() for x in (points, weights))
+                observed = []
+
+                def capture(tensor, dim, index, source):
+                    observed.append(source)
+                    return scatter_add(tensor, dim, index, source)
+
+                with patch.object(torch.Tensor, "scatter_add_", capture):
+                    lattice_kde(*inputs, 0.3)
+                (actual,) = observed
+
+                pitch = 0.3 / 2
+                size = math.ceil(2 / pitch) + 2
+                frac = ((points + 1) / pitch).clamp(0, size - 1 - 1e-4).frac()
+                corners = torch.tensor(list(itertools.product((False, True), repeat=d)))
+                tent = torch.where(corners, frac[:, :, None], 1 - frac[:, :, None])
+                expected = (tent.prod(-1) * weights[..., None]).flatten(1)
+                self.assertTrue(torch.equal(actual, expected))
+
+                seed = torch.rand(actual.shape, generator=rng) * 2 - 1
+                actual_grad = torch.autograd.grad(actual, inputs, seed)
+                expected_grad = torch.autograd.grad(expected, inputs, seed)
+                for got, wanted in zip(actual_grad, expected_grad):
+                    self.assertTrue(torch.equal(got, wanted))
+
+    def test_blur_matches_independent_lines_at_broad_bandwidth(self):
+        rng = torch.Generator().manual_seed(200)
+        points = torch.rand(2, 64, 4, generator=rng) * 1.8 - 0.9
+        weights = torch.rand(2, 64, generator=rng) + 0.1
+        cotangent = torch.rand(2, 64, generator=rng) * 2 - 1
+        conv1d = torch.nn.functional.conv1d
+
+        def independent_lines(data, kernel, padding, groups=1):
+            size = data.shape[-1]
+            return conv1d(
+                data.reshape(-1, 1, size), kernel[:1], padding=padding
+            ).reshape_as(data)
+
+        results = []
+        for use_reference in (False, True):
+            inputs = tuple(x.clone().requires_grad_() for x in (points, weights))
+            convolution = independent_lines if use_reference else conv1d
+            with patch.object(torch.nn.functional, "conv1d", convolution):
+                value = lattice_kde(*inputs, 2.0)
+                results.append((value, *torch.autograd.grad(value, inputs, cotangent)))
+        for actual, expected in zip(*results):
+            self.assertTrue(torch.equal(actual, expected))
+
 
 if __name__ == "__main__":
     unittest.main()
