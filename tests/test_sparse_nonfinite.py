@@ -102,6 +102,68 @@ class RejectedSparseGeometryTest(unittest.TestCase):
                 with self.subTest(gemm=gemm, exact=exact, direction=direction):
                     self.run_case(gemm, exact, direction, 0, 2.0)
 
+    def test_empty_keypoint_sets_are_unmatched_with_zero_gradients(self):
+        model = FlexGlue(**{**vars(self.model.conf), "n_layers": 1}).eval()
+        for batch in (1, 2):
+            data = {
+                key: value.expand(batch, *value.shape[1:]).clone()
+                for key, value in self.data.items()
+            }
+            for counts in ((0, 3), (3, 0), (0, 0)):
+                inputs = [
+                    {**data, "keypoints": data["keypoints"][:, :count]}
+                    for count in counts
+                ]
+                originals = [
+                    {key: value.clone() for key, value in item.items()}
+                    for item in inputs
+                ]
+                for gemm, exact in ((True, False), (True, True), (False, False)):
+                    with self.subTest(
+                        batch=batch, counts=counts, gemm=gemm, exact=exact
+                    ):
+                        model.zero_grad(set_to_none=True)
+                        result = model.match(
+                            *inputs, sparse=True, gemm_nn=gemm, exact_nn=exact
+                        )
+                        for i, count in enumerate(counts):
+                            confidence = result[f"confidence{i}"]
+                            matches = result[f"matches{i}"]
+                            scores = result[f"matching_scores{i}"]
+                            self.assertEqual(matches.shape, (batch, count))
+                            self.assertEqual(scores.shape, (batch, count))
+                            self.assertEqual(matches.dtype, torch.long)
+                            self.assertEqual(scores.dtype, confidence.dtype)
+                            self.assertEqual(matches.device, confidence.device)
+                            self.assertEqual(scores.device, confidence.device)
+                            self.assertTrue((matches == -1).all())
+                            self.assertEqual(scores.count_nonzero(), 0)
+                            if count:
+                                self.assertTrue((confidence > 0).any())
+                            for key, original in originals[i].items():
+                                torch.testing.assert_close(inputs[i][key], original)
+                        self.assertIsNot(result["matches0"], result["matches1"])
+                        self.assertIsNot(
+                            result["matching_scores0"], result["matching_scores1"]
+                        )
+                        sum(
+                            result[f"matching_scores{i}"].sum() for i in (0, 1)
+                        ).backward()
+                        self.assertIsNotNone(model.heads[1].matchability.bias.grad)
+                        gradients = [
+                            p.grad for p in model.parameters() if p.grad is not None
+                        ]
+                        for gradient in gradients:
+                            self.assertTrue(gradient.isfinite().all())
+                            self.assertEqual(gradient.count_nonzero(), 0)
+                        for i in (0, 1):
+                            confidence = result[f"confidence{i}"].clone()
+                            with torch.no_grad():
+                                result[f"matching_scores{i}"].fill_(1)
+                            torch.testing.assert_close(
+                                result[f"confidence{i}"], confidence
+                            )
+
     def test_rejected_zero_confidence_has_finite_model_gradients(self):
         model = FlexGlue(**{**vars(self.model.conf), "n_layers": 1}).eval()
         with torch.no_grad():

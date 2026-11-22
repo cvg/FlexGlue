@@ -544,6 +544,20 @@ class FlexGlue(nn.Module):
 
     def sparse_matches(self, pred: dict, data0: dict, data1: dict, conf) -> dict:
         """Mutual nearest neighbours of keypoints and predicted points."""
+        if not data0["keypoints"].shape[1] or not data1["keypoints"].shape[1]:
+            dtype = torch.promote_types(
+                pred["confidence0"].dtype, pred["confidence1"].dtype
+            )
+            result = {}
+            for i in (0, 1):
+                confidence = pred[f"confidence{i}"]
+                matches = torch.full_like(confidence, -1, dtype=torch.long)
+                result[f"matches{i}"] = matches
+                # Preserve the zero-gradient connection of rejected scores.
+                result[f"matching_scores{i}"] = torch.where(
+                    matches >= 0, confidence, 0
+                ).to(dtype)
+            return result
         data0, data1 = self._with_resized_size(data0), self._with_resized_size(data1)
         # Geometry controls discrete selection; confidence keeps its gradients.
         kpts0 = self.to_resized(data0["keypoints"], data0).detach()
