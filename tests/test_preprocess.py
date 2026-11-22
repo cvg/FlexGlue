@@ -55,6 +55,13 @@ class ImageConversionTest(unittest.TestCase):
         converted.fill_(0.5)
         self.assertEqual(int(source.sum()), 0)
 
+    def test_broadcast_image_keeps_dense_channel_planes(self):
+        row = np.arange(21, dtype=np.uint8).reshape(1, 7, 3)
+        image = np.broadcast_to(row, (4, 7, 3))
+        expected = legacy_image_to_torch(image).view(3, -1)
+        actual = numpy_image_to_torch(image).view(3, -1)
+        self.assertTrue(torch.equal(actual, expected))
+
     def test_empty_and_single_pixel(self):
         self.assert_legacy_equal(np.empty((0, 0), dtype=np.uint8))
         self.assert_legacy_equal(np.array([[255]], dtype=np.uint8))

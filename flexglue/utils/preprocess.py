@@ -124,11 +124,9 @@ def numpy_image_to_torch(image: np.ndarray) -> torch.Tensor:
     else:
         raise ValueError(f"Not an image: {image.shape}")
     if type(image) is np.ndarray and image.dtype == np.uint8:
-        # Copy handles negative strides and keeps caller pixels independent.
+        # Division handles negative strides and keeps caller pixels independent.
         # The FP32 division matches the previous FP64 path for all byte values.
-        output = np.array(image, dtype=np.float32, copy=True, order="K")
-        np.divide(output, np.float32(255), out=output)
-        return torch.as_tensor(output)
+        return torch.as_tensor(np.divide(image, np.float32(255), dtype=np.float32))
     return torch.tensor(image / 255.0, dtype=torch.float)
 
 
