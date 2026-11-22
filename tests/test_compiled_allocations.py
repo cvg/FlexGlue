@@ -29,7 +29,7 @@ class CompiledAllocationTest(unittest.TestCase):
         with patch("torch.compile", side_effect=lambda fn, **kw: fn):
             self.model.compile(static_lengths=(4,))
 
-    def test_exact_bucket_reuses_contiguous_only_and_preserves_outputs(self):
+    def test_compiled_buckets_own_queries_and_preserve_outputs(self):
         head = self.model.heads[0]
         real = head.compiled_forward
         for kind in ("exact", "strided", "padded"):
@@ -58,12 +58,38 @@ class CompiledAllocationTest(unittest.TestCase):
                 used = call.call_args.args[0]
                 self.assertTrue(used.is_contiguous())
                 self.assertEqual(used.shape[1], 4)
-                if kind == "exact":
-                    self.assertEqual(used.data_ptr(), points.data_ptr())
-                else:
-                    self.assertNotEqual(used.data_ptr(), points.data_ptr())
+                self.assertNotEqual(used.data_ptr(), points.data_ptr())
                 for left, right in zip(actual, expected):
                     torch.testing.assert_close(left, right, rtol=0, atol=0)
+
+    def test_custom_compiled_head_can_mutate_its_exact_bucket(self):
+        def shifted(_head, points, _cf_i, _cf_j):
+            points.add_(1)
+            return points, points[..., 0]
+
+        model = matcher()
+        head = model.heads[0]
+        head.forward = shifted.__get__(head)
+        real_compile = torch.compile
+        with patch(
+            "torch.compile",
+            side_effect=lambda fn, **kw: real_compile(
+                fn, backend="eager", fullgraph=kw["fullgraph"]
+            ),
+        ):
+            model.compile(static_lengths=(4,))
+        queries = torch.zeros(1, 4, 2)
+        with torch.no_grad():
+            positions, confidence = model.run_head(
+                0, queries, self.features, self.features
+            )
+        torch.testing.assert_close(queries, torch.zeros_like(queries), rtol=0, atol=0)
+        torch.testing.assert_close(
+            positions, torch.ones_like(positions), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            confidence, torch.ones_like(confidence), rtol=0, atol=0
+        )
 
     def test_exact_bucket_preserves_input_and_parameter_gradients(self):
         head = self.model.heads[0]

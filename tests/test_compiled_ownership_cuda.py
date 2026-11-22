@@ -25,17 +25,19 @@ class CudaCompiledOwnershipTest(unittest.TestCase):
         features = torch.randn(1, 8, 2, 2, device="cuda")
         points = torch.rand(1, 4, 2, device="cuda") * 2 - 1
         with torch.inference_mode():
-            original = model.run_head(1, points, features, features)[0]
-            saved = original.clone()
+            original = model.run_head(1, points, features, features)
+            saved = tuple(value.clone() for value in original)
             copied = copy.deepcopy(model)
             copied.heads[1].offset_head.head[-1].bias[:17].add_(
                 torch.arange(17, device="cuda")
             )
-            expected = copied.heads[1](points, features, features)[0]
-            actual = copied.run_head(1, points, features, features)[0]
+            copied.heads[1].matchability.bias.add_(3)
+            expected = copied.heads[1](points, features, features)
+            actual = copied.run_head(1, points, features, features)
             torch.testing.assert_close(actual, expected)
-            self.assertFalse(torch.allclose(actual, saved))
-            torch.testing.assert_close(original, saved, rtol=0, atol=0)
+            for retained, value, changed in zip(original, saved, actual):
+                self.assertFalse(torch.allclose(changed, value))
+                torch.testing.assert_close(retained, value, rtol=0, atol=0)
 
     def test_transformer_copy_follows_dtype_and_parameters(self):
         model = make_matcher().cuda().compile(mode="default", static_lengths=(4,))
