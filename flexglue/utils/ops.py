@@ -169,29 +169,63 @@ def lattice_kde(
     points: torch.Tensor, weights: torch.Tensor, std: float
 ) -> torch.Tensor:
     """Weighted gaussian kde (B, N) of points (B, N, D) in [-1, 1] at themselves."""
+    if not math.isfinite(std) or std <= 0 or not 0 < std * std < math.inf:
+        raise ValueError("std must be finite, positive and have a finite square.")
     b, n, d = points.shape
     pitch = std / 2  # splat to a lattice, blur it, read it back: cost independent of N
     size = math.ceil(2 / pitch) + 2
-    u = ((points.float() + 1) / pitch).clamp(0, size - 1 - 1e-4)
-    base, frac = u.floor().long(), u.frac()
-    corners = torch.cartesian_prod(*[torch.arange(2, device=points.device)] * d)
-    strides = size ** torch.arange(d - 1, -1, -1, device=points.device)
-    idx = ((base[:, :, None] + corners) * strides).sum(-1).flatten(1)  # (B, N * 2^d)
-    tent = torch.where(corners.bool(), frac[:, :, None], 1 - frac[:, :, None]).prod(-1)
-    lattice = u.new_zeros(b, size**d)
-    lattice.scatter_add_(1, idx, (tent * weights[..., None].float()).flatten(1))
-    # splat and read tents add pitch^2 / 6 each
+    if size**d > torch.iinfo(torch.int64).max:
+        raise ValueError("std produces an unrepresentable lattice.")
+    # Validate kernel arithmetic before allocating the lattice or indexing it.
     s = math.sqrt(std**2 - pitch**2 / 3)
     r = math.ceil(3 * s / pitch)
-    k = torch.arange(-r, r + 1, device=points.device) * pitch
+    precision = torch.finfo(torch.float32)
+    # Pitch conversion and multiplication each round once to float32.
+    max_root = math.sqrt(precision.max) / (1 + precision.eps / 2) ** 2
+    if r * pitch > max_root or 2 * s * s > precision.max:
+        raise ValueError("std exceeds the finite float32 kernel range.")
+    u = ((points.float() + 1) / pitch).clamp(0, size - 1 - 1e-4)
+    base, frac = u.floor().long(), u.frac()
+    # Below this precision bound, the existing upper margin stays representable.
+    if (size - 1) * precision.eps >= 1e-4:
+        # Float32 can round to the final cell: keep its mass at the upper corner.
+        if size >= 2**63 - 2**39:
+            # A rounded 2**63 cannot be represented by the int64 conversion.
+            base = torch.where(u >= float(2**63), size - 1, base)
+        frac = torch.where(base >= size - 1, 1.0, frac)
+        base = base.clamp(max=size - 2)
+    corners = torch.cartesian_prod(
+        *[torch.arange(2, device=points.device)] * d
+    ).reshape(-1, d)
+    strides = size ** torch.arange(d - 1, -1, -1, device=points.device)
+    point_idx = (base * strides).sum(-1)
+    corner_idx = (corners * strides).sum(-1)
+    del u, base, strides
+    # Finish the native tent product before expanding the corner addresses.
+    factors = torch.where(corners.bool(), frac[:, :, None], 1 - frac[:, :, None])
+    del frac, corners
+    tent = factors.prod(-1)
+    del factors
+    idx = (point_idx[..., None] + corner_idx).flatten(1)  # (B, N * 2^d)
+    del point_idx, corner_idx
+    lattice = tent.new_zeros(b, size**d)
+    lattice.scatter_add_(1, idx, (tent * weights[..., None].float()).flatten(1))
+    # splat and read tents add pitch^2 / 6 each
+    k = torch.arange(-r, r + 1, device=points.device, dtype=lattice.dtype) * pitch
     kernel = (std / s * torch.exp(-(k**2) / (2 * s**2))).view(1, 1, -1)
     lattice = lattice.view(b, *[size] * d)
     for dim in range(1, d + 1):
         x = lattice.movedim(dim, -1)
-        x = F.conv1d(x.reshape(-1, 1, size), kernel, padding=r).view(x.shape)
-        lattice = x.movedim(-1, dim)
+        shape = x.shape
+        x = x.reshape(-1, 1, size)
+        # Retire the old layout before the convolution allocates its workspace.
+        del lattice
+        lattice = F.conv1d(x, kernel, padding=r).view(shape).movedim(-1, dim)
+        del x
     lattice = lattice.reshape(b, -1)
-    return (lattice.gather(1, idx).view_as(tent) * tent).sum(-1)
+    values = lattice.gather(1, idx).view_as(tent)
+    del lattice, idx
+    return (values * tent).sum(-1)
 
 
 def kde_weights(
@@ -205,8 +239,9 @@ def kde_weights(
 ) -> torch.Tensor:
     """RoMa v2's balanced sampling weights (B, N) of the valid (score > 0) cells."""
     valid = (scores > 0).float()
-    pool = valid.sum(1).clamp(max=expansion * num_samples)
-    scale = pool / valid.sum(1).clamp_min(1)  # density in samples of RoMa's pool
+    count = valid.sum(1)
+    pool = count.clamp(max=expansion * num_samples)
+    scale = pool / count.clamp_min(1)  # density in samples of RoMa's pool
     min_support = (min_density * pool)[:, None]  # RoMa: 10 of a 4 x 5000 pool
     points = []
     for i, grid in enumerate((dense_p2d0_n1, dense_p2d1_n0)):
