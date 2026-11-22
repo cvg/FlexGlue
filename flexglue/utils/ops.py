@@ -161,7 +161,14 @@ def grid_sources(grid: torch.Tensor) -> torch.Tensor:
 def sample_cells(weights: torch.Tensor, n: int) -> tuple:
     """Sample at most n unique cells of (B, N) weights: indices (B, n), (B, n, 2)."""
     n = min(n, weights.shape[1])
-    idx = torch.multinomial(weights.clamp_min(1e-12), n, replacement=False)
+    if n == 0:
+        idx = weights.new_empty((weights.shape[0], 0), dtype=torch.long)
+    else:
+        probabilities = weights.clamp_min(1e-12)
+        if weights.dtype == torch.float16:
+            # The floor rounds to zero in Half; sample empty rows uniformly.
+            probabilities.masked_fill_(~probabilities.any(dim=-1, keepdim=True), 1)
+        idx = torch.multinomial(probabilities, n, replacement=False)
     return idx, idx[..., None].expand(-1, -1, 2)
 
 
@@ -212,9 +219,9 @@ def kde_weights(
     for i, grid in enumerate((dense_p2d0_n1, dense_p2d1_n0)):
         pair = [grid_sources(grid).flatten(1, 2), grid.flatten(1, 2)]
         points.append(torch.cat([pair[i], pair[1 - i]], -1))  # (x0, x1) normalized
-    density = (
-        lattice_kde(torch.cat(points, 1), valid, std) * scale[:, None]
-    )  # unweighted
+    points = torch.cat(points, 1)
+    points.masked_fill_((valid[..., None] == 0) & points.isnan(), 0)
+    density = lattice_kde(points, valid, std) * scale[:, None]  # unweighted
     balance = torch.where(density < min_support, 1e-7, 1 / (density + 1))
     return balance * valid  # valid cells only, no extra confidence weighting
 
