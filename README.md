@@ -314,6 +314,27 @@ matcher = FlexGlue().eval().cuda().compile(mode="reduce-overhead")
 ```
 The transformer layers and the correspondence heads are compiled into CUDA graphs. Keypoints are padded to the next of `static_lengths` (512, 1024, 2048, 4096 by default), larger inputs fall back to eager mode. The first calls of each new input size are slow while compiling.
 
+
+### Ordered image prefetch
+
+Use `read_images(paths, prefetch=True)` as a context manager to overlap OpenCV
+decoding with consumer work. It yields `(path, image)` pairs in input order;
+conversion, GPU upload and model work remain on the consumer thread.
+
+```python
+from flexglue.utils import read_images
+
+with read_images(paths, prefetch=True) as images:
+    for path, image in images:
+        # Process the image here; release it before advancing when possible.
+        pass
+```
+
+Prefetch is opt-in and uses two CPU workers with at most two pending reads.
+Keeping the previous image while advancing can transiently retain four decoded
+images. Consumed images are released when the caller drops them; closing the
+context joins workers, including after an error or early exit.
+
 ## torch.hub
 
 FlexGlue can also be loaded with `torch.hub`, without installing this repository. Arguments are passed to `FlexGlue`:
