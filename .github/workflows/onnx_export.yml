@@ -27,6 +27,8 @@ concurrency:
 jobs:
   export-and-check:
     runs-on: ubuntu-latest
+    env:
+      ORT_DISABLE_TELEMETRY: "1"
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
