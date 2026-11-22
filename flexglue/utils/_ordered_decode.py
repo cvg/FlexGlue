@@ -70,6 +70,7 @@ def ordered_decode(rows, loader, *, enabled, stats=None):
             future = executor.submit(loader, row)
             stats["submitted"] += 1
         pending.append((row, future))
+        del future  # Source exceptions keep this frame in their traceback.
         stats["maxPending"] = max(stats["maxPending"], len(pending))
         if len(pending) > 2:
             raise RuntimeError("prefetch bound exceeded")
@@ -77,9 +78,11 @@ def ordered_decode(rows, loader, *, enabled, stats=None):
     def receive():
         row, future = pending.popleft()
         waited = time.perf_counter()
-        value = future.result()
+        try:
+            value = future.result()
+        finally:
+            del future  # A failed Future must not own its traceback's frame.
         stats["consumerWaitSeconds"] += time.perf_counter() - waited
-        del future
         stats["consumed"] += 1
         submit()
         return row, value

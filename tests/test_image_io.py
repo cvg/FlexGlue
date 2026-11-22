@@ -161,6 +161,52 @@ class Scheduling(unittest.TestCase):
                     with helper.ordered_decode(source(), load, enabled=enabled) as rows:
                         list(rows)
 
+    def test_failure_does_not_retain_released_source(self):
+        for source_fails in (False, True):
+            with self.subTest(source_fails=source_fails):
+
+                class Source:
+                    def __init__(self):
+                        self.rows = iter(range(4))
+
+                    def __iter__(self):
+                        return self
+
+                    def __next__(self):
+                        row = next(self.rows)
+                        if source_fails and row == 1:
+                            raise LookupError("source")
+                        return row
+
+                def load(row):
+                    if not source_fails and row == 1:
+                        raise LookupError("loader")
+                    return row
+
+                source_iterator = Source()
+                reference = weakref.ref(source_iterator)
+                gc_enabled = gc.isenabled()
+                gc.disable()
+                try:
+                    try:
+                        with helper.ordered_decode(
+                            source_iterator, load, enabled=True
+                        ) as rows:
+                            self.assertEqual(next(rows), (0, 0))
+                            next(rows)
+                    except LookupError as error:
+                        self.assertEqual(
+                            str(error), "source" if source_fails else "loader"
+                        )
+                    else:
+                        self.fail("expected the second row to fail")
+                    del source_iterator
+                    self.assertIsNone(reference())
+                finally:
+                    gc.collect()
+                    if gc_enabled:
+                        gc.enable()
+
     def test_public_default_serial(self):
         owner = threading.get_ident()
         original = scope["read_image"]
