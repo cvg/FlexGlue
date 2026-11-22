@@ -100,6 +100,88 @@ class DescriptorFrameTest(unittest.TestCase):
         }
         self.context = SimpleNamespace(covisibility_score=torch.ones(1))
 
+    def test_describe_inputs_restores_the_overridable_resized_size(self):
+        class CustomFrame(FlexGlue):
+            def resized_size(self, features, image_size):
+                return super().resized_size(features, image_size) + 8
+
+        model = CustomFrame(**vars(self.model.conf)).eval()
+        incoming = torch.ones(1, 2)
+        data = {
+            **self.data0,
+            "image_size": self.data0["image_size"].half(),
+            "resized_size": incoming,
+        }
+        a, b = model.describe_inputs(data, self.data1, model.conf)
+        torch.testing.assert_close(a["resized_size"], torch.tensor([[40.0, 24.0]]))
+        torch.testing.assert_close(b["resized_size"], torch.tensor([[24.0, 40.0]]))
+        self.assertIs(data["resized_size"], incoming)
+        self.assertNotIn("resized_size", self.data1)
+
+    def test_explicit_geometry_packet_and_two_argument_conversion(self):
+        size0, size1 = torch.tensor([[16.0, 8.0]]), torch.tensor([[8.0, 16.0]])
+        data0 = {**self.data0, "resized_size": size0}
+        data1 = {**self.data1, "resized_size": size1}
+        pred = {
+            "confidence0": torch.ones(1, 1),
+            "confidence1": torch.ones(1, 1),
+            "p2d0_i1": data1["keypoints"],
+            "p2d1_i0": data0["keypoints"],
+        }
+        dense = {
+            "dense_p2d0_n1": torch.zeros(1, 1, 1, 2),
+            "dense_p2d0_i1": data1["keypoints"][:, None],
+            "dense_confidence0": torch.ones(1, 1, 1),
+        }
+        conf = self.model.resolve_conf(
+            {"max_distance_px": 0.0, "remove_border_px": 0.0}
+        )
+        convert = self.model.to_resized
+        received = []
+
+        def legacy_convert(points, packet):
+            received.append(id(packet))
+            return convert(points, packet)
+
+        with patch.object(self.model, "to_resized", new=legacy_convert):
+            gated = self.model.gate_points(pred, self.context, data0, data1, conf)
+            self.assertTrue(gated["valid0"].item())
+            self.assertTrue(gated["valid1"].item())
+            sparse = self.model.sparse_matches(gated, data0, data1, conf)
+            self.assertEqual(sparse["matches0"].item(), 0)
+            grid = self.model.gate_dense(dense, self.context, data0, data1, conf)
+            self.assertTrue(grid["dense_valid0"].item())
+        a, b = id(data0), id(data1)
+        self.assertEqual(received, [a, b, b, a, a, b, b, a, b])
+
+        packet = {"image_size": data0["image_size"], "resized_size": size0}
+        actual = convert(data0["keypoints"], packet)
+        torch.testing.assert_close(actual, torch.tensor([[[4.0, 4.0]]]))
+
+    def test_public_matching_keeps_two_argument_resize_override(self):
+        frames = []
+
+        class LegacyConversion(FlexGlue):
+            def to_resized(self, points, data_i):
+                frames.append(data_i["resized_size"])
+                return super().to_resized(points, data_i)
+
+        model = LegacyConversion(**vars(self.model.conf)).eval()
+        model.load_state_dict(self.model.state_dict())
+        for name, overrides, conversions in (
+            ("match", {"sparse": False}, 4),
+            ("match", {"sparse": True}, 8),
+            ("match_dense", {}, 2),
+        ):
+            with self.subTest(name=name, **overrides), torch.no_grad():
+                frames.clear()
+                conf = {"max_distance_px": 0.0, **overrides}
+                expected = getattr(self.model, name)(self.data0, self.data1, **conf)
+                actual = getattr(model, name)(self.data0, self.data1, **conf)
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                self.assertEqual(len(frames), conversions)
+                self.assertEqual(len({id(size) for size in frames}), 2)
+
     def test_cached_geometry_and_integer_size_border(self):
         for dtype in (torch.int64, torch.float32):
             data = {**self.data0, "image_size": self.data0["image_size"].to(dtype)}
@@ -263,6 +345,10 @@ class DescriptorFrameTest(unittest.TestCase):
             self.model, "descriptor_size", wraps=self.model.descriptor_size
         ) as size:
             self.model.gate_points(pred, self.context, self.data0, self.data1, conf)
+            self.assertEqual(size.call_count, 2)
+            size.reset_mock()
+            data0, data1 = self.model.describe_inputs(self.data0, self.data1, conf)
+            self.model.gate_points(pred, self.context, data0, data1, conf)
             self.assertEqual(size.call_count, 2)
 
     def test_batch_scales_original_sizes_independently(self):
