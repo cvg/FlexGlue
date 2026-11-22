@@ -1,22 +1,110 @@
+import inspect
 import math
+import mmap
+import zipfile
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
 
-def load_state_dict(weights: str, prefix: str) -> dict:
-    """Load a state dict from a local path or URL and keep the entries under prefix."""
+def _mapped_local_checkpoint(weights: str) -> bool:
+    """Use mapping only for modern local files under the original CPU/FP32 setup."""
+    path = Path(weights)
+    return (
+        path.is_file()
+        and hasattr(mmap, "MAP_PRIVATE")
+        and callable(getattr(torch.serialization, "get_default_mmap_options", None))
+        and callable(getattr(torch, "get_default_device", None))
+        and zipfile.is_zipfile(path)
+        and torch.get_default_dtype() == torch.float32
+        and torch.get_default_device().type == "cpu"
+        and torch.serialization.get_default_mmap_options() == mmap.MAP_PRIVATE
+    )
+
+
+def _read_state_dict(weights: str, *, allow_mmap: bool = False) -> dict:
     if Path(weights).exists():
-        state_dict = torch.load(weights, map_location="cpu", weights_only=True)
-    else:
-        state_dict = torch.hub.load_state_dict_from_url(weights, map_location="cpu")
+        if allow_mmap and _mapped_local_checkpoint(weights):
+            return torch.load(weights, map_location="cpu", weights_only=True, mmap=True)
+        return torch.load(weights, map_location="cpu", weights_only=True)
+    return torch.hub.load_state_dict_from_url(
+        weights, map_location="cpu", weights_only=True
+    )
+
+
+def load_state_dict(
+    weights: str, prefix: str, *, state_dict=None, allow_mmap: bool = False
+) -> dict:
+    """Load or reuse a CPU state dict and keep the entries under prefix."""
+    if state_dict is None:
+        state_dict = _read_state_dict(weights, allow_mmap=allow_mmap)
     state_dict = {
         k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)
     }
     if not state_dict:
         raise KeyError(f"No weights with prefix {prefix!r} in {weights}.")
     return state_dict
+
+
+def _unique_storage(tensors) -> bool:
+    seen = set()
+    for tensor in tensors:
+        if not isinstance(tensor, torch.Tensor) or tensor.layout != torch.strided:
+            return False
+        if tensor.numel() == 0:
+            continue
+        key = (tensor.device, tensor.untyped_storage().data_ptr())
+        if key in seen:
+            return False
+        seen.add(key)
+    return True
+
+
+def _can_assign(module, state_dict: dict) -> bool:
+    target = module.state_dict()
+    if set(state_dict) != set(target):
+        return False
+    if not _unique_storage(target.values()) or not _unique_storage(state_dict.values()):
+        return False
+    for name, source in state_dict.items():
+        destination = target.get(name)
+        if destination is None or not isinstance(source, torch.Tensor):
+            return False
+        if (
+            source.device != destination.device
+            or source.dtype != destination.dtype
+            or source.layout != destination.layout
+            or source.shape != destination.shape
+            or source.stride() != destination.stride()
+            or source.storage_offset() != destination.storage_offset()
+        ):
+            return False
+    return True
+
+
+def load_into_module(
+    module,
+    state_dict: dict,
+    weights: str,
+    *,
+    strict: bool = True,
+    source_unique: bool = True,
+    allow_assign: bool = False,
+):
+    """Assign only an exact, untied CPU/FP32 mapped subset during construction."""
+    assign = (
+        allow_assign
+        and source_unique
+        and _mapped_local_checkpoint(weights)
+        and "assign" in inspect.signature(module.load_state_dict).parameters
+        and _can_assign(module, state_dict)
+    )
+    if assign:
+        incompatible = module.load_state_dict(state_dict, strict=strict, assign=True)
+    else:
+        incompatible = module.load_state_dict(state_dict, strict=strict)
+    return incompatible, assign
 
 
 def normalize_keypoints(kpts: torch.Tensor, size: torch.Tensor) -> torch.Tensor:

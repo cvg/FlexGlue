@@ -105,29 +105,73 @@ class DINOv3Descriptor(nn.Module):
     default_conf = {
         "resize": (512, 512),  # int: long side, aspect kept, (h, w): squashed
         "describe": True,  # layer-0 descriptors at the keypoints, if there are any
+        "mp": None,  # None: fp32; "float16": resident half backbone and feature head
+        "mmap_weights": False,  # opt in to immutable local CPU checkpoint backing
         "weights": WEIGHTS_URL,
     }
     edge_divisible_by = 32  # backbone stride
 
-    def __init__(self, **conf) -> None:
+    def __init__(
+        self,
+        *,
+        state_dict: Optional[dict] = None,
+        _assign_source_unique: Optional[bool] = None,
+        _assign_owned_state: bool = False,
+        **conf,
+    ) -> None:
         super().__init__()
         self.conf = conf = SimpleNamespace(**{**self.default_conf, **conf})
+        if conf.mp not in (None, "float16"):
+            raise ValueError("descriptor mp must be None or 'float16'.")
+        if not isinstance(conf.mmap_weights, bool):
+            raise ValueError("descriptor mmap_weights must be a bool.")
         pp.check_resize(conf.resize, self.edge_divisible_by)
         self.backbone = ConvNeXt()
         self.head = LinearConvHead()
         self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406])[:, None, None])
         self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225])[:, None, None])
 
-        state_dict = ops.load_state_dict(conf.weights, "extractor.")
+        source_owned = conf.mmap_weights and (state_dict is None or _assign_owned_state)
+        if state_dict is None:
+            state_dict = ops._read_state_dict(
+                conf.weights, allow_mmap=conf.mmap_weights
+            )
+        source_unique = source_owned and ops._unique_storage(state_dict.values())
+        if _assign_source_unique is not None:
+            source_unique = source_unique and _assign_source_unique
+        state_dict = ops.load_state_dict(
+            conf.weights, "extractor.", state_dict=state_dict
+        )
         sub = lambda p: {  # noqa: E731
             k.removeprefix(p): v for k, v in state_dict.items() if k.startswith(p)
         }
-        self.backbone.load_state_dict(sub("backbone."))
-        self.head.load_state_dict(sub("head."))
+        ops.load_into_module(
+            self.backbone,
+            sub("backbone."),
+            conf.weights,
+            source_unique=source_unique,
+            allow_assign=conf.mmap_weights,
+        )
+        ops.load_into_module(
+            self.head,
+            sub("head."),
+            conf.weights,
+            source_unique=source_unique,
+            allow_assign=conf.mmap_weights,
+        )
         # layer-0 matcher head, input_proj and to_search fused into one linear map
         descriptor_head = sub("descriptor_head.")
         self.descriptor_head = nn.Linear(*descriptor_head["weight"].shape[::-1])
-        self.descriptor_head.load_state_dict(descriptor_head)
+        ops.load_into_module(
+            self.descriptor_head,
+            descriptor_head,
+            conf.weights,
+            source_unique=source_unique,
+            allow_assign=conf.mmap_weights,
+        )
+        if conf.mp == "float16":
+            self.backbone.half()
+            self.head.half()
 
     def forward(self, data: dict, resize: Optional[pp.Resize] = None) -> dict:
         """Features of data["image"] (Images), descriptors at data["keypoints"]."""
@@ -144,7 +188,13 @@ class DINOv3Descriptor(nn.Module):
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Dense features (B, C, h / 8, w / 8) of images already at the input size."""
-        return self.head(self.backbone((x - self.mean) / self.std))
+        normalized = (x - self.mean) / self.std
+        if self.conf.mp == "float16":
+            normalized = normalized.to(next(self.backbone.parameters()).dtype)
+        features = self.head(self.backbone(normalized))
+        if self.conf.mp == "float16":
+            features = features.to(self.descriptor_head.weight.dtype)
+        return features
 
     def preprocess(
         self, img: pp.Images, resize: Optional[pp.Resize] = None
