@@ -691,6 +691,7 @@ class FlexGlue(nn.Module):
                 or getattr(module._load_from_state_dict, "__func__", None)
                 is not nn.Module._load_from_state_dict
                 or getattr(module._load_from_state_dict, "__self__", None) is not module
+                or type(module).set_extra_state is not nn.Module.set_extra_state
                 for name, module in self.named_modules()
                 if name not in ("descriptor", "refiner")
                 and not name.startswith(("descriptor.", "refiner."))

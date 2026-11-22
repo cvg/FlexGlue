@@ -642,6 +642,65 @@ class WeightLoadingTest(unittest.TestCase):
                 model.load_weights(self.path, state_dict=invalid)
         torch.testing.assert_close(model.input_proj.weight, original, rtol=0, atol=0)
 
+    def test_custom_extra_state_uses_native_loading(self):
+        class ExtraState:
+            def get_extra_state(self):
+                return self.extra_value
+
+            def set_extra_state(self, value):
+                self.extra_value = value
+                self.extra_calls += 1
+
+        class StatefulMatcher(ExtraState, FlexGlue):
+            pass
+
+        class StatefulLinear(ExtraState, nn.Linear):
+            pass
+
+        class Metadata(ExtraState, nn.Module):
+            pass
+
+        for location in ("root", "projection", "head_child"):
+            for tensor_state in (False, True):
+                with self.subTest(location=location, tensor_state=tensor_state):
+                    cls = StatefulMatcher if location == "root" else FlexGlue
+                    model = cls(weights=None, **self.conf)
+                    if location == "projection":
+                        model.input_proj = StatefulLinear(4, 8)
+                        owner = model.input_proj
+                    elif location == "head_child":
+                        model.heads[1].metadata = Metadata()
+                        owner = model.heads[1].metadata
+                    else:
+                        owner = model
+                    owner.extra_value = (
+                        torch.zeros(1) if tensor_state else {"version": 0}
+                    )
+                    owner.extra_calls = 0
+                    state = {
+                        "matcher." + key: value
+                        for key, value in model.state_dict().items()
+                    }
+                    key = next(key for key in state if key.endswith("_extra_state"))
+                    value = torch.arange(3) if tensor_state else {"version": 2}
+                    state[key] = value
+                    state["matcher.input_proj.bias"] = torch.full_like(
+                        model.input_proj.bias, 7
+                    )
+                    torch.save(state, self.path)
+                    owners = [id(parameter) for parameter in model.parameters()]
+                    model.load_weights(self.path)
+                    if tensor_state:
+                        torch.testing.assert_close(owner.extra_value, value)
+                    else:
+                        self.assertEqual(owner.extra_value, value)
+                    self.assertEqual(owner.extra_calls, 1)
+                    self.assertEqual(model.loaded_heads, {0, 1, 2})
+                    self.assertEqual(owners, [id(p) for p in model.parameters()])
+                    torch.testing.assert_close(
+                        model.input_proj.bias, state["matcher.input_proj.bias"]
+                    )
+
     def test_empty_checkpoint_rejected(self):
         with self.assertRaisesRegex(KeyError, "No weights with prefix 'matcher.'"):
             self.build({})
